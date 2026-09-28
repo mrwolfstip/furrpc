@@ -3,6 +3,7 @@ import ServiceManagement
 
 let defaultid = "1554136413669433354"
 let fallbackimage = "https://files.catbox.moe/95gjsg.png"
+let githuburl = "https://github.com/mrwolfstip/furrpc"
 let supportdir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("furrpc")
 let configurl = supportdir.appendingPathComponent("config.json")
 let logurl = supportdir.appendingPathComponent("furrpc.log")
@@ -66,10 +67,28 @@ var apps: [String] {
 // flag defaults to on, flagoff defaults to off (for options that must be opted into)
 func flag(_ key: String) -> Bool { cfg[key] as? Bool ?? true }
 func flagoff(_ key: String) -> Bool { cfg[key] as? Bool ?? false }
-// per app name and image chosen by the user, stored as { bundle id: { "name": ..., "image": ... } }
+// apps the user switched off in the table. they stay in the list but get no presence
+var disabled: [String] {
+    get { cfg["disabled"] as? [String] ?? [] }
+    set { cfg["disabled"] = newValue }
+}
+// per app name, image and client id chosen by the user, stored as { bundle id: { "name": ..., "image": ..., "client_id": ... } }
 var overrides: [String: [String: String]] {
     get { cfg["overrides"] as? [String: [String: String]] ?? [:] }
     set { cfg["overrides"] = newValue }
+}
+
+struct approw {
+    var id: String
+    var enabled = true
+    var name = ""
+    var clientid = ""
+    var image = ""
+}
+
+func place(_ view: NSView, _ x: CGFloat, _ y: CGFloat, _ w: CGFloat, _ h: CGFloat, in parent: NSView) {
+    view.frame = NSRect(x: x, y: y, width: w, height: h)
+    parent.addSubview(view)
 }
 
 func setlogin(_ on: Bool) {
@@ -82,7 +101,7 @@ func setlogin(_ on: Bool) {
 }
 var loginon: Bool { SMAppService.mainApp.status == .enabled }
 
-// bundled games.json first, then the user's own file on top of it
+// games.json is local only: the bundled example (shows the format), then the user's own file on top of it. nothing is downloaded
 func loadgames() -> [String: [String: String]] {
     var out: [String: [String: String]] = [:]
     let files = [Bundle.main.url(forResource: "games", withExtension: "json"), supportdir.appendingPathComponent("games.json")]
@@ -163,11 +182,13 @@ final class ipc {
     var last: [String: Any]?
     var warned = false
     var lastname: String?
+    var cid = ""
 
     var connected: Bool { fd >= 0 }
 
-    func connect() {
+    func connect(_ id: String) {
         guard fd < 0 else { return }
+        cid = id
         for i in 0..<10 {
             let s = socket(AF_UNIX, SOCK_STREAM, 0)
             guard s >= 0 else { return }
@@ -215,7 +236,7 @@ final class ipc {
         source.setCancelHandler { close(f) }
         source.resume()
         src = source
-        send(0, ["v": 1, "client_id": clientid])
+        send(0, ["v": 1, "client_id": id])
     }
 
     func drop() {
@@ -259,23 +280,22 @@ final class ipc {
     }
 }
 
-final class furrpc: NSObject, NSApplicationDelegate, NSMenuDelegate {
+final class furrpc: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTableViewDataSource, NSTableViewDelegate {
     let rpc = ipc()
     var games: [String: [String: String]] = [:]
     var timer: Timer?
     var item: NSStatusItem?
     var win: NSWindow?
-    var text: NSTextView!
+    var tabs: NSTabView!
+    var table: NSTableView!
+    var hint: NSTextField!
+    var status: NSTextField!
     var idfield: NSTextField!
     var popup: NSPopUpButton!
     var checks: [NSButton] = []
     var running: [String] = []
+    var rows: [approw] = []
     var tempwarned = false
-    var custompopup: NSPopUpButton!
-    var namefield: NSTextField!
-    var imagefield: NSTextField!
-    var pending: [String: [String: String]] = [:]
-    var curcustom: String?
 
     func applicationDidFinishLaunching(_ n: Notification) {
         logger.info("furrpc started, \(hwline)")
@@ -314,9 +334,10 @@ final class furrpc: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // the app to show: the one in front if it is on the list, otherwise (with background on) the first listed app that is running
     func target() -> NSRunningApplication? {
-        if let f = NSWorkspace.shared.frontmostApplication, let id = f.bundleIdentifier, apps.contains(id) { return f }
+        let on = apps.filter { !disabled.contains($0) }
+        if let f = NSWorkspace.shared.frontmostApplication, let id = f.bundleIdentifier, on.contains(id) { return f }
         guard flagoff("background") else { return nil }
-        for id in apps {
+        for id in on {
             if let r = NSRunningApplication.runningApplications(withBundleIdentifier: id).first(where: { !$0.isTerminated }) { return r }
         }
         return nil
@@ -331,10 +352,16 @@ final class furrpc: NSObject, NSApplicationDelegate, NSMenuDelegate {
             rpc.set(nil)
             return
         }
-        rpc.connect()
         let g = games[id]
         let mine = overrides[id]
         func pick(_ v: String?) -> String? { (v?.isEmpty ?? true) ? nil : v }
+        // each app can use its own discord application. a different client id means a new connection
+        let cid = pick(mine?["client_id"]) ?? pick(g?["client_id"]) ?? clientid
+        if rpc.connected && rpc.cid != cid {
+            logger.info("client id changed, reconnecting")
+            rpc.drop()
+        }
+        rpc.connect(cid)
         let name = pick(mine?["name"]) ?? g?["name"] ?? a.localizedName?.lowercased() ?? id
         let image = pick(mine?["image"]) ?? g?["image"] ?? fallbackimage
         var act: [String: Any] = [
@@ -402,136 +429,429 @@ final class furrpc: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func buildwindow() {
-        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 590), styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        let W: CGFloat = 640, H: CGFloat = 620
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: W, height: H), styleMask: [.titled, .closable], backing: .buffered, defer: false)
         w.title = "furrpc"
         w.isReleasedWhenClosed = false
         w.center()
         let v = w.contentView!
-        func put(_ view: NSView, _ x: CGFloat, _ y: CGFloat, _ wd: CGFloat, _ h: CGFloat) {
-            view.frame = NSRect(x: x, y: y, width: wd, height: h)
-            v.addSubview(view)
+
+        // header: name and one line summary on the left, github link and logo top right
+        let title = NSTextField(labelWithString: "furrpc")
+        title.font = .boldSystemFont(ofSize: 22)
+        place(title, 20, 574, 200, 28, in: v)
+        let sub = NSTextField(labelWithString: "finds the process, matches it to an image, and sends it to your discord")
+        sub.font = .systemFont(ofSize: 12)
+        sub.textColor = .secondaryLabelColor
+        place(sub, 20, 556, 440, 16, in: v)
+        if let logo = Bundle.main.image(forResource: "furrpc") {
+            let iv = NSImageView(image: logo)
+            iv.imageScaling = .scaleProportionallyUpOrDown
+            iv.wantsLayer = true
+            iv.layer?.cornerRadius = 10
+            iv.layer?.masksToBounds = true
+            place(iv, W - 20 - 48, 562, 48, 48, in: v)
         }
-        put(NSTextField(labelWithString: "apps to show (one bundle id per line)"), 20, 555, 360, 17)
-        let scroll = NSTextView.scrollableTextView()
-        text = scroll.documentView as? NSTextView
-        text.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
-        text.isAutomaticQuoteSubstitutionEnabled = false
-        text.isAutomaticDashSubstitutionEnabled = false
-        text.isAutomaticTextReplacementEnabled = false
-        text.isAutomaticSpellingCorrectionEnabled = false
-        scroll.borderType = .bezelBorder
-        put(scroll, 20, 415, 360, 130)
+        // white icon and text, so it sits on a black pill to stay readable in light and dark mode
+        let gh = NSButton(title: "github", target: self, action: #selector(opengithub))
+        gh.isBordered = false
+        gh.wantsLayer = true
+        gh.layer?.backgroundColor = NSColor.black.cgColor
+        gh.layer?.cornerRadius = 6
+        gh.attributedTitle = NSAttributedString(string: " github", attributes: [.foregroundColor: NSColor.white, .font: NSFont.systemFont(ofSize: 12)])
+        if let icon = githubicon() {
+            gh.image = icon
+            gh.imagePosition = .imageLeft
+        }
+        gh.toolTip = githuburl
+        place(gh, W - 20 - 48 - 12 - 88, 574, 88, 24, in: v)
+
+        let t = NSTabView()
+        tabs = t
+        place(t, 12, 56, W - 24, 490, in: v)
+        let cr = t.contentRect
+        let cw = cr.width, ch = cr.height
+        func tab(_ label: String) -> NSView {
+            let item = NSTabViewItem()
+            item.label = label
+            let view = NSView(frame: NSRect(x: 0, y: 0, width: cw, height: ch))
+            item.view = view
+            t.addTabViewItem(item)
+            return view
+        }
+
+        // tab 1: setup guide
+        let guide = tab("setup")
+        let gs = NSTextView.scrollableTextView()
+        let gt = gs.documentView as! NSTextView
+        gt.isEditable = false
+        gt.isSelectable = true
+        gt.textContainerInset = NSSize(width: 10, height: 10)
+        gt.textStorage?.setAttributedString(guidetext())
+        gs.borderType = .bezelBorder
+        place(gs, 8, 8, cw - 16, ch - 16, in: guide)
+
+        // tab 2: apps table
+        let appsview = tab("apps")
+        hint = NSTextField(labelWithString: "")
+        hint.font = .systemFont(ofSize: 11)
+        hint.textColor = .secondaryLabelColor
+        place(hint, 8, ch - 24, cw - 16, 16, in: appsview)
+        table = NSTableView()
+        let cols: [(String, String, CGFloat, CGFloat)] = [
+            ("on", "on", 30, 30), ("name", "name", 105, 60), ("bundle", "bundle id", 140, 80),
+            ("client", "client id", 125, 70), ("image", "image / asset", 100, 60), ("actions", "", 96, 96),
+        ]
+        for (id, label, width, minw) in cols {
+            let c = NSTableColumn(identifier: NSUserInterfaceItemIdentifier(id))
+            c.title = label
+            c.width = width
+            c.minWidth = minw
+            table.addTableColumn(c)
+        }
+        table.dataSource = self
+        table.delegate = self
+        table.rowHeight = 26
+        table.usesAlternatingRowBackgroundColors = true
+        table.allowsColumnReordering = false
+        table.target = self
+        table.doubleAction = #selector(editclicked(_:))
+        let ts = NSScrollView()
+        ts.documentView = table
+        ts.hasVerticalScroller = true
+        ts.hasHorizontalScroller = true
+        ts.borderType = .bezelBorder
+        place(ts, 8, 72, cw - 16, ch - 104, in: appsview)
         popup = NSPopUpButton(frame: .zero, pullsDown: false)
-        put(popup, 20, 380, 300, 26)
-        put(NSButton(title: "add", target: self, action: #selector(addrunning)), 325, 380, 55, 26)
+        popup.menu?.delegate = self
+        place(popup, 8, 38, cw - 16 - 150, 26, in: appsview)
+        place(NSButton(title: "add running app", target: self, action: #selector(addrunning)), cw - 8 - 142, 38, 142, 26, in: appsview)
+        place(NSButton(title: "add by bundle id…", target: self, action: #selector(addmanual)), 8, 8, 150, 26, in: appsview)
 
-        put(NSTextField(labelWithString: "customize an app (blank means default)"), 20, 348, 360, 17)
-        custompopup = NSPopUpButton(frame: .zero, pullsDown: false)
-        custompopup.menu?.delegate = self
-        custompopup.target = self
-        custompopup.action = #selector(pickcustom)
-        put(custompopup, 20, 318, 360, 26)
-        put(NSTextField(labelWithString: "name shown in discord"), 20, 294, 360, 17)
-        namefield = NSTextField(string: "")
-        put(namefield, 20, 270, 360, 22)
-        put(NSTextField(labelWithString: "icon url (or asset name)"), 20, 246, 360, 17)
-        imagefield = NSTextField(string: "")
-        put(imagefield, 20, 222, 360, 22)
-
-        put(NSTextField(labelWithString: "discord application id"), 20, 192, 360, 17)
+        // tab 3: settings
+        let sv = tab("settings")
+        let idlabel = NSTextField(labelWithString: "default client id (discord application id)")
+        idlabel.font = .boldSystemFont(ofSize: 12)
+        place(idlabel, 12, ch - 32, cw - 24, 17, in: sv)
         idfield = NSTextField(string: "")
-        put(idfield, 20, 164, 360, 22)
+        place(idfield, 12, ch - 58, cw - 24, 22, in: sv)
+        let idhint = NSTextField(labelWithString: "used by every app without a client id of its own. see step 2 in the setup tab.")
+        idhint.font = .systemFont(ofSize: 11)
+        idhint.textColor = .secondaryLabelColor
+        place(idhint, 12, ch - 78, cw - 24, 16, in: sv)
         let titles = ["show temperature", "menu bar item", "start at login", "show even when the app is in the background"]
         for (n, title) in titles.enumerated() {
             let b = NSButton(checkboxWithTitle: title, target: nil, action: nil)
-            put(b, 20, CGFloat(132 - n * 23), n == 3 ? 360 : 250, 20)
+            place(b, 12, ch - 116 - CGFloat(n * 26), cw - 24, 20, in: sv)
             checks.append(b)
         }
+        place(NSButton(title: "show local folder", target: self, action: #selector(openfolder)), 12, ch - 238, 150, 26, in: sv)
+        let fh = NSTextField(labelWithString: "config.json, furrpc.log and your own games.json live there.")
+        fh.font = .systemFont(ofSize: 11)
+        fh.textColor = .secondaryLabelColor
+        place(fh, 170, ch - 233, cw - 182, 16, in: sv)
+
+        // bottom bar
+        status = NSTextField(labelWithString: "")
+        status.textColor = .secondaryLabelColor
+        place(status, 20, 24, 400, 17, in: v)
         let save = NSButton(title: "save", target: self, action: #selector(savewin))
         save.keyEquivalent = "\r"
-        put(save, 285, 20, 100, 30)
+        place(save, W - 20 - 100, 16, 100, 30, in: v)
         win = w
     }
 
-    func listedapps() -> [String] {
-        text.string.split(whereSeparator: \.isNewline).map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
-    }
-
-    // keeps whatever is typed in the name and icon fields for the app that is selected
-    func commitfields() {
-        guard let id = curcustom else { return }
-        var e: [String: String] = [:]
-        let n = namefield.stringValue.trimmingCharacters(in: .whitespaces)
-        let i = imagefield.stringValue.trimmingCharacters(in: .whitespaces)
-        if !n.isEmpty { e["name"] = n }
-        if !i.isEmpty { e["image"] = i }
-        pending[id] = e.isEmpty ? nil : e
-    }
-
-    func loadfields() {
-        curcustom = custompopup.titleOfSelectedItem
-        let e = curcustom.flatMap { pending[$0] } ?? [:]
-        namefield.stringValue = e["name"] ?? ""
-        imagefield.stringValue = e["image"] ?? ""
-        let g = curcustom.flatMap { games[$0] }
-        namefield.placeholderString = g?["name"] ?? "default name"
-        imagefield.placeholderString = g?["image"] ?? fallbackimage
-        namefield.isEnabled = curcustom != nil
-        imagefield.isEnabled = curcustom != nil
-    }
-
-    @objc func pickcustom() {
-        commitfields()
-        loadfields()
-    }
-
-    // the customize list always matches what is currently typed in the apps box
-    func menuNeedsUpdate(_ menu: NSMenu) {
-        guard custompopup != nil, menu === custompopup.menu else { return }
-        commitfields()
-        let keep = custompopup.titleOfSelectedItem
-        custompopup.removeAllItems()
-        custompopup.addItems(withTitles: listedapps())
-        if let k = keep, custompopup.itemTitles.contains(k) { custompopup.selectItem(withTitle: k) }
-        loadfields()
-    }
-
-    @objc func showwindow() {
-        if win == nil { buildwindow() }
-        text.string = apps.joined(separator: "\n")
-        idfield.stringValue = clientid
-        checks[0].state = flag("temperature") ? .on : .off
-        checks[1].state = flag("menubar") ? .on : .off
-        checks[2].state = loginon ? .on : .off
-        checks[3].state = flagoff("background") ? .on : .off
-        pending = overrides
-        curcustom = nil
-        custompopup.removeAllItems()
-        custompopup.addItems(withTitles: apps)
-        loadfields()
-        let list = NSWorkspace.shared.runningApplications.filter {
-            $0.activationPolicy == .regular && $0.bundleIdentifier != nil && $0 != NSRunningApplication.current
+    // the github icon is black on transparent. invert the colors (black becomes white) and keep the alpha
+    func githubicon() -> NSImage? {
+        guard let src = Bundle.main.image(forResource: "github"),
+              let cg = src.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return nil }
+        let wd = cg.width, ht = cg.height
+        guard wd > 0, ht > 0,
+              let ctx = CGContext(data: nil, width: wd, height: ht, bitsPerComponent: 8, bytesPerRow: wd * 4,
+                                  space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue),
+              let data = ctx.data else { return nil }
+        ctx.draw(cg, in: CGRect(x: 0, y: 0, width: wd, height: ht))
+        let px = data.bindMemory(to: UInt8.self, capacity: wd * ht * 4)
+        for i in 0..<(wd * ht) {
+            let a = Int(px[i * 4 + 3])
+            if a == 0 { continue }
+            for c in 0..<3 {
+                let straight = min(255, Int(px[i * 4 + c]) * 255 / a)
+                px[i * 4 + c] = UInt8((255 - straight) * a / 255)
+            }
         }
-        running = list.map { $0.bundleIdentifier! }
-        popup.removeAllItems()
-        popup.addItems(withTitles: list.map { ($0.localizedName ?? "").lowercased() + "  " + $0.bundleIdentifier! })
+        guard let out = ctx.makeImage() else { return nil }
+        return NSImage(cgImage: out, size: NSSize(width: 14, height: 14))
+    }
+
+    func guidetext() -> NSAttributedString {
+        let parts: [(String, Bool)] = [
+            ("welcome to furrpc\n", true),
+            ("furrpc finds the process, matches it to an image, and sends it to your discord. set it up once, change it any time. keep the discord desktop app open while you use it.\n\n", false),
+            ("1. create a discord application\n", true),
+            ("open discord.com/developers/applications, press new application, name it and create it. discord shows this name as what you are playing.\n\n", false),
+            ("2. copy its client id\n", true),
+            ("on the application page open general information and copy the application id. this long number is the client id. paste it in the settings tab as the default client id, or give a single app its own in the apps tab.\n\n", false),
+            ("3. upload rich presence assets\n", true),
+            ("in the application open rich presence, then art assets, and upload your pictures. the name of each asset is what you type as the image. new assets can take a few minutes to show up in discord.\n\n", false),
+            ("4. pick an image\n", true),
+            ("for each app use an asset name from step 3 (like my_game) or a full image url starting with https://. leave it blank to use the default image.\n\n", false),
+            ("5. add your apps\n", true),
+            ("open the app or game you want to show, come back here and open the apps tab. choose it in the list and press add running app, or press add by bundle id and type it (like com.example.game). use edit on a row to set its name, client id and image.\n\n", false),
+            ("6. save\n", true),
+            ("press save at the bottom right. only enabled apps are shown, and only while they are in front unless you turn on the background option in settings.\n\n", false),
+            ("changing things later\n", true),
+            ("everything can be changed at any time. click :3 in the menu bar and choose open furrpc, or open the app again. use the checkbox to turn an app off, edit to change it and remove to delete it, then press save.", false),
+        ]
+        let out = NSMutableAttributedString()
+        for (text, heading) in parts {
+            out.append(NSAttributedString(string: text, attributes: [
+                .font: heading ? NSFont.boldSystemFont(ofSize: 13) : NSFont.systemFont(ofSize: 13),
+                .foregroundColor: NSColor.labelColor,
+            ]))
+        }
+        let s = out.string as NSString
+        let r = s.range(of: "discord.com/developers/applications")
+        if r.location != NSNotFound {
+            out.addAttribute(.link, value: URL(string: "https://discord.com/developers/applications")!, range: r)
+        }
+        return out
+    }
+
+    // table
+
+    func numberOfRows(in tableView: NSTableView) -> Int { rows.count }
+
+    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+        guard let col = tableColumn?.identifier.rawValue, row >= 0, row < rows.count else { return nil }
+        let r = rows[row]
+        func label(_ text: String, dim: Bool) -> NSTextField {
+            let f = NSTextField(labelWithString: text)
+            f.lineBreakMode = .byTruncatingTail
+            f.textColor = dim ? .secondaryLabelColor : .labelColor
+            f.alphaValue = r.enabled ? 1 : 0.5
+            f.toolTip = text
+            return f
+        }
+        let g = games[r.id]
+        switch col {
+        case "on":
+            let b = NSButton(checkboxWithTitle: "", target: self, action: #selector(togglerow(_:)))
+            b.state = r.enabled ? .on : .off
+            b.tag = row
+            return b
+        case "name": return label(r.name.isEmpty ? (g?["name"] ?? "default") : r.name, dim: r.name.isEmpty)
+        case "bundle": return label(r.id, dim: false)
+        case "client": return label(r.clientid.isEmpty ? (g?["client_id"] ?? "default") : r.clientid, dim: r.clientid.isEmpty)
+        case "image": return label(r.image.isEmpty ? (g?["image"] ?? "default") : r.image, dim: r.image.isEmpty)
+        case "actions":
+            let box = NSView()
+            for (n, title) in ["edit", "remove"].enumerated() {
+                let b = NSButton(title: title, target: self, action: n == 0 ? #selector(editclicked(_:)) : #selector(removeclicked(_:)))
+                b.bezelStyle = .inline
+                b.controlSize = .small
+                b.font = .systemFont(ofSize: 11)
+                b.tag = row
+                b.frame = NSRect(x: n == 0 ? 0 : 46, y: 3, width: n == 0 ? 42 : 56, height: 20)
+                box.addSubview(b)
+            }
+            return box
+        default: return nil
+        }
+    }
+
+    @objc func togglerow(_ sender: NSButton) {
+        guard sender.tag >= 0 && sender.tag < rows.count else { return }
+        rows[sender.tag].enabled = sender.state == .on
+        table.reloadData()
+    }
+
+    @objc func removeclicked(_ sender: NSButton) {
+        guard sender.tag >= 0 && sender.tag < rows.count else { return }
+        rows.remove(at: sender.tag)
+        table.reloadData()
+        updatehint()
+    }
+
+    // the edit button passes its row in the tag, a double click on the table uses the clicked row
+    @objc func editclicked(_ sender: Any?) {
+        let i = (sender as? NSButton)?.tag ?? table.clickedRow
+        guard i >= 0 && i < rows.count else { return }
+        if let r = editrow(rows[i], isnew: false) {
+            rows[i] = r
+            table.reloadData()
+        }
+    }
+
+    func updatehint() {
+        hint.stringValue = rows.isEmpty
+            ? "no apps yet. read the setup tab, add an app below, then press save."
+            : "tick to turn an app on or off. edit or remove it with the buttons. press save to apply."
+    }
+
+    func alert(_ text: String) {
+        let a = NSAlert()
+        a.messageText = text
+        a.addButton(withTitle: "ok")
         NSApp.activate(ignoringOtherApps: true)
-        win?.makeKeyAndOrderFront(nil)
+        a.runModal()
+    }
+
+    func checkclient(_ s: String) -> String? {
+        (s.isEmpty || s.allSatisfy { $0.isASCII && $0.isNumber }) ? nil : "a client id is a long number, digits only"
+    }
+
+    func checkimage(_ s: String) -> String? {
+        if s.contains(" ") { return "an image url or asset name has no spaces" }
+        if s.contains("://") && !(s.hasPrefix("https://") || s.hasPrefix("http://")) { return "use an https:// image url or an asset name" }
+        return nil
+    }
+
+    func validate(_ r: approw, isnew: Bool) -> String? {
+        if r.id.isEmpty { return "enter a bundle id, like com.example.game" }
+        if r.id.contains(" ") { return "a bundle id has no spaces" }
+        if isnew && rows.contains(where: { $0.id == r.id }) { return "that app is already in the list" }
+        return checkclient(r.clientid) ?? checkimage(r.image)
+    }
+
+    // one small dialog for both adding and editing an app. blank fields mean default
+    func editrow(_ start: approw, isnew: Bool) -> approw? {
+        var r = start
+        while true {
+            let a = NSAlert()
+            a.messageText = isnew ? "add an app" : "edit app"
+            a.informativeText = "leave name, client id or image blank to use the default."
+            a.addButton(withTitle: "ok")
+            a.addButton(withTitle: "cancel")
+            let box = NSView(frame: NSRect(x: 0, y: 0, width: 360, height: 176))
+            let labels = ["bundle id", "name shown in discord", "client id (discord application id)", "image url or asset name"]
+            let vals = [r.id, r.name, r.clientid, r.image]
+            var fields: [NSTextField] = []
+            for (n, text) in labels.enumerated() {
+                let y = CGFloat(176 - (n + 1) * 44)
+                place(NSTextField(labelWithString: text), 0, y + 22, 360, 16, in: box)
+                let f = NSTextField(string: vals[n])
+                place(f, 0, y, 360, 22, in: box)
+                fields.append(f)
+            }
+            fields[0].isEnabled = isnew
+            fields[0].placeholderString = "com.example.game"
+            fields[1].placeholderString = games[r.id]?["name"] ?? "default name"
+            fields[2].placeholderString = games[r.id]?["client_id"] ?? "default (settings tab)"
+            fields[3].placeholderString = games[r.id]?["image"] ?? "default image"
+            a.accessoryView = box
+            a.window.initialFirstResponder = fields[isnew ? 0 : 1]
+            NSApp.activate(ignoringOtherApps: true)
+            guard a.runModal() == .alertFirstButtonReturn else { return nil }
+            func val(_ i: Int) -> String { fields[i].stringValue.trimmingCharacters(in: .whitespaces) }
+            r.id = val(0)
+            r.name = val(1)
+            r.clientid = val(2)
+            r.image = val(3)
+            if let err = validate(r, isnew: isnew) {
+                alert(err)
+                continue
+            }
+            return r
+        }
+    }
+
+    @objc func addmanual() {
+        if let r = editrow(approw(id: ""), isnew: true) {
+            rows.append(r)
+            table.reloadData()
+            table.scrollRowToVisible(rows.count - 1)
+            updatehint()
+        }
     }
 
     @objc func addrunning() {
         let i = popup.indexOfSelectedItem
         guard i >= 0 && i < running.count else { return }
-        if !text.string.isEmpty && !text.string.hasSuffix("\n") { text.string += "\n" }
-        text.string += running[i] + "\n"
+        let id = running[i]
+        if rows.contains(where: { $0.id == id }) {
+            alert("that app is already in the list")
+            return
+        }
+        rows.append(approw(id: id))
+        table.reloadData()
+        table.scrollRowToVisible(rows.count - 1)
+        updatehint()
+    }
+
+    func refreshrunning() {
+        var seen = Set<String>()
+        let list = NSWorkspace.shared.runningApplications.filter {
+            guard $0.activationPolicy == .regular, let id = $0.bundleIdentifier, $0 != NSRunningApplication.current else { return false }
+            return seen.insert(id).inserted
+        }
+        let keep = popup.titleOfSelectedItem
+        running = list.map { $0.bundleIdentifier! }
+        popup.removeAllItems()
+        popup.addItems(withTitles: list.map { ($0.localizedName ?? "").lowercased() + "  " + $0.bundleIdentifier! })
+        if let k = keep, popup.itemTitles.contains(k) { popup.selectItem(withTitle: k) }
+    }
+
+    // the running list is refreshed every time the popup opens
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        guard popup != nil, menu === popup.menu else { return }
+        refreshrunning()
+    }
+
+    @objc func opengithub() {
+        if let u = URL(string: githuburl) { NSWorkspace.shared.open(u) }
+    }
+
+    @objc func openfolder() {
+        try? FileManager.default.createDirectory(at: supportdir, withIntermediateDirectories: true)
+        NSWorkspace.shared.open(supportdir)
+    }
+
+    // fills the window from the saved config
+    func loadwindow() {
+        idfield.stringValue = clientid
+        checks[0].state = flag("temperature") ? .on : .off
+        checks[1].state = flag("menubar") ? .on : .off
+        checks[2].state = loginon ? .on : .off
+        checks[3].state = flagoff("background") ? .on : .off
+        let off = disabled
+        rows = apps.map { id in
+            let o = overrides[id] ?? [:]
+            return approw(id: id, enabled: !off.contains(id), name: o["name"] ?? "", clientid: o["client_id"] ?? "", image: o["image"] ?? "")
+        }
+        table.reloadData()
+        updatehint()
+        refreshrunning()
+        // nothing set up yet: start on the setup guide
+        tabs.selectTabViewItem(at: apps.isEmpty ? 0 : 1)
+        status.stringValue = ""
+    }
+
+    @objc func showwindow() {
+        if win == nil { buildwindow() }
+        // do not throw away edits when the window is already open
+        if win?.isVisible != true { loadwindow() }
+        NSApp.activate(ignoringOtherApps: true)
+        win?.makeKeyAndOrderFront(nil)
     }
 
     @objc func savewin() {
-        commitfields()
-        apps = listedapps()
-        // only keep customizations for apps that are still on the list
-        overrides = pending.filter { apps.contains($0.key) }
         let id = idfield.stringValue.trimmingCharacters(in: .whitespaces)
+        if let m = checkclient(id) {
+            alert(m)
+            return
+        }
+        apps = rows.map { $0.id }
+        disabled = rows.filter { !$0.enabled }.map { $0.id }
+        var o: [String: [String: String]] = [:]
+        for r in rows {
+            var e: [String: String] = [:]
+            if !r.name.isEmpty { e["name"] = r.name }
+            if !r.clientid.isEmpty { e["client_id"] = r.clientid }
+            if !r.image.isEmpty { e["image"] = r.image }
+            if !e.isEmpty { o[r.id] = e }
+        }
+        overrides = o
         cfg["client_id"] = id.isEmpty ? defaultid : id
         cfg["temperature"] = checks[0].state == .on
         cfg["menubar"] = checks[1].state == .on
@@ -539,6 +859,8 @@ final class furrpc: NSObject, NSApplicationDelegate, NSMenuDelegate {
         savecfg()
         setlogin(checks[2].state == .on)
         reload()
+        idfield.stringValue = clientid
+        status.stringValue = "saved"
     }
 }
 
@@ -557,8 +879,11 @@ func runcli(_ a: [String]) {
       set login on|off          start at login
       set id <application id>   use another discord application
       set background on|off     show even when the app is not in front
+      enable <bundle id>        turn an app on
+      disable <bundle id>       turn an app off without removing it
       set name <bundle id> [name]     change the name shown in discord (no name resets it)
       set image <bundle id> [url]     change the icon url or asset name (no url resets it)
+      set appid <bundle id> [id]      give one app its own client id (no id resets it)
       status                    show all settings
       log [lines]               show the log file path and its last lines (default 40)
     """
@@ -578,18 +903,24 @@ func runcli(_ a: [String]) {
         if !apps.contains(arg) { apps.append(arg) }
     case "remove" where !arg.isEmpty:
         apps.removeAll { $0 == arg }
+        disabled.removeAll { $0 == arg }
+    case "enable" where !arg.isEmpty:
+        disabled.removeAll { $0 == arg }
+    case "disable" where !arg.isEmpty:
+        if !disabled.contains(arg) { disabled.append(arg) }
     case "set" where !val.isEmpty:
         switch arg {
         case "temp": cfg["temperature"] = val == "on"
         case "menubar": cfg["menubar"] = val == "on"
         case "login": setlogin(val == "on")
         case "background": cfg["background"] = val == "on"
-        case "name", "image":
+        case "name", "image", "appid":
             // furrpc set name <bundle id> <name...>, an empty value removes the customization
+            let key = arg == "appid" ? "client_id" : arg
             let rest = a.dropFirst(3).joined(separator: " ")
             var o = overrides
             var e = o[val] ?? [:]
-            e[arg] = rest.isEmpty ? nil : rest
+            e[key] = rest.isEmpty ? nil : rest
             o[val] = e.isEmpty ? nil : e
             overrides = o
         case "id": cfg["client_id"] = val
@@ -610,6 +941,7 @@ func runcli(_ a: [String]) {
         print("menubar: \(onoff(flag("menubar")))")
         print("login: \(onoff(loginon))")
         print("background: \(onoff(flagoff("background")))")
+        print("disabled: \(disabled.count)")
         print("customized: \(overrides.count)")
         print("id: \(clientid)")
         changed = false
