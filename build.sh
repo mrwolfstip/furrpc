@@ -23,7 +23,7 @@ done
 iconutil -c icns $iconset -o $app/Contents/Resources/AppIcon.icns
 rm -rf $iconset
 [ -f menubar.png ] && cp menubar.png $app/Contents/Resources/
-# the github icon is fetched here, once, while building. the app itself never downloads anything
+# the github icon is fetched here, once, while building. the app itself only fetches tvmaze data, and only when apple tv lookups are on
 if ! curl -fsSL --retry 2 -m 30 -o $app/Contents/Resources/github.png https://cdn-icons-png.flaticon.com/256/25/25231.png; then
   rm -f $app/Contents/Resources/github.png
   echo "warning: could not fetch the github icon, the link will show text only"

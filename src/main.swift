@@ -173,6 +173,380 @@ func starttime(_ a: NSRunningApplication) -> Date {
     return d
 }
 
+// apple tv: the macos apple tv app has no api, but it reports what it plays to mediaremote. macos only lets apple-signed
+// processes read that (an ad-hoc signed app like furrpc gets nothing), so a small osascript (jxa) child does the reading.
+// it prints one json line whenever the playback changes, plus a slow safety check in case a notification is missed
+let tvbundle = "com.apple.TV"
+var tvon: Bool { flagoff("appletv") }
+let tvtextkeys = ["appletv_name", "appletv_line1", "appletv_line2", "appletv_movie"]
+
+let tvjs = #"""
+ObjC.import('Foundation');
+ObjC.import('unistd');
+ObjC.import('stdlib');
+var last = '';
+var ticks = 0;
+function out(o) {
+  var s = $(JSON.stringify(o) + '\n');
+  $.NSFileHandle.fileHandleWithStandardOutput.writeData(s.dataUsingEncoding($.NSUTF8StringEncoding));
+}
+function str(v) { return typeof v === 'string' && v.length ? v : null; }
+function num(v) {
+  if (v instanceof Date) return v.getTime() / 1000;
+  return typeof v === 'number' ? v : null;
+}
+function get(raw, key) {
+  try { return ObjC.unwrap(raw.objectForKey('kMRMediaRemoteNowPlayingInfo' + key)); } catch (e) { return null; }
+}
+function read() {
+  var cls = $.NSClassFromString('MRNowPlayingRequest');
+  var ok = false;
+  try { ok = cls.respondsToSelector('localNowPlayingItem'); } catch (e) {}
+  if (!ok) return { error: 'mediaremote is not available to osascript on this mac' };
+  try {
+    var raw = cls.localNowPlayingItem.nowPlayingInfo;
+    var title = str(get(raw, 'Title'));
+    if (!title) return { none: true };
+    var bundle = null;
+    try { bundle = str(ObjC.unwrap(cls.localNowPlayingPlayerPath.client.bundleIdentifier)); } catch (e) {}
+    return {
+      bundle: bundle,
+      show: str(get(raw, 'Album')),
+      title: title,
+      elapsed: num(get(raw, 'ElapsedTime')),
+      duration: num(get(raw, 'Duration')),
+      rate: num(get(raw, 'PlaybackRate')),
+      stamp: num(get(raw, 'Timestamp')),
+      release: num(get(raw, 'ReleaseDate')),
+      type: get(raw, 'MediaType')
+    };
+  } catch (e) {
+    return { none: true, detail: String(e) };
+  }
+}
+function check() {
+  var st = read();
+  if (st.error) { out(st); $.exit(3); }
+  var j = JSON.stringify(st);
+  if (j !== last) { last = j; out(st); }
+}
+ObjC.registerSubclass({
+  name: 'furrpcwatch',
+  methods: {
+    'changed:': { types: ['void', ['id']], implementation: function (n) { if (!once) check(); } },
+    'tick:': { types: ['void', ['id']], implementation: function (t) {
+      if ($.getppid() === 1) $.exit(0);
+      if (once) {
+        ticks++;
+        if (ticks < 3) return;
+        var st = read();
+        st.once = true;
+        out(st);
+        $.exit(st.error ? 3 : 0);
+      }
+      check();
+    } }
+  }
+});
+$.NSBundle.bundleWithPath('/System/Library/PrivateFrameworks/MediaRemote.framework').load;
+var obs = $.furrpcwatch.alloc.init;
+var how = 'safety check only';
+try {
+  ObjC.bindFunction('MRMediaRemoteRegisterForNowPlayingNotifications', ['void', ['id']]);
+  $.MRMediaRemoteRegisterForNowPlayingNotifications($.NSOperationQueue.mainQueue.underlyingQueue);
+  var nc = $.NSNotificationCenter.defaultCenter;
+  ['kMRMediaRemoteNowPlayingInfoDidChangeNotification',
+   'kMRMediaRemoteNowPlayingApplicationIsPlayingDidChangeNotification',
+   'kMRMediaRemoteNowPlayingApplicationDidChangeNotification'].forEach(function (name) {
+    nc.addObserverSelectorNameObject(obs, 'changed:', name, $());
+  });
+  how = 'notifications';
+} catch (e) {}
+$.NSTimer.scheduledTimerWithTimeIntervalTargetSelectorUserInfoRepeats(once ? 0.4 : 15, obs, 'tick:', $(), true);
+if (!once) { out({ ready: how }); check(); }
+$.NSRunLoop.currentRunLoop.run;
+"""#
+
+func tvscript(once: Bool) -> String { "var once = \(once);\n" + tvjs }
+
+struct tvstate {
+    var show = ""
+    var title = ""
+    var elapsed = 0.0
+    var duration = 0.0
+    var rate = 0.0
+    var stamp = 0.0
+    var release = 0.0
+}
+
+struct tvinfo {
+    var season: Int?
+    var number: Int?
+    var episodeimage: String?
+    var showimage: String?
+}
+
+// lowercase words only, so "In Perpetuity" and "in perpetuity!" match
+func tvnorm(_ s: String) -> String {
+    s.folding(options: [.diacriticInsensitive, .caseInsensitive], locale: nil)
+        .split { !$0.isLetter && !$0.isNumber }
+        .joined(separator: " ")
+}
+
+func tvimage(_ o: Any?) -> String? {
+    guard let d = o as? [String: Any], var u = (d["original"] as? String) ?? (d["medium"] as? String) else { return nil }
+    if u.hasPrefix("http://") { u = "https://" + String(u.dropFirst(7)) }
+    return u
+}
+
+// tvmaze only adds season, episode number and artwork. everything is cached in the support folder so the same
+// episode never asks again: one search per show, one episode list per show (again after a day if an episode is unknown)
+final class tvmaze {
+    let file = supportdir.appendingPathComponent("appletv-cache.json")
+    var shows: [String: [String: Any]] = [:]
+    var episodes: [String: [String: Any]] = [:]
+    var busy = Set<String>()
+    var retry: [String: Date] = [:]
+
+    init() {
+        let d = (try? JSONSerialization.jsonObject(with: Data(contentsOf: file))) as? [String: Any]
+        shows = d?["shows"] as? [String: [String: Any]] ?? [:]
+        episodes = d?["episodes"] as? [String: [String: Any]] ?? [:]
+    }
+
+    func save() {
+        try? FileManager.default.createDirectory(at: supportdir, withIntermediateDirectories: true)
+        let d: [String: Any] = ["shows": shows, "episodes": episodes]
+        try? JSONSerialization.data(withJSONObject: d, options: [.sortedKeys]).write(to: file)
+    }
+
+    func get(_ path: String, _ done: @escaping (Any?) -> Void) {
+        guard let url = URL(string: "https://api.tvmaze.com" + path) else { return done(nil) }
+        var req = URLRequest(url: url, timeoutInterval: 10)
+        req.setValue("furrpc", forHTTPHeaderField: "User-Agent")
+        URLSession.shared.dataTask(with: req) { data, resp, _ in
+            var obj: Any?
+            if let data = data, (resp as? HTTPURLResponse)?.statusCode == 200 { obj = try? JSONSerialization.jsonObject(with: data) }
+            DispatchQueue.main.async { done(obj) }
+        }.resume()
+    }
+
+    // returns whatever is cached right now and starts at most one request for the missing piece. done runs when it lands
+    func lookup(show: String, episode: String, done: @escaping () -> Void) -> tvinfo {
+        var out = tvinfo()
+        let sk = tvnorm(show)
+        guard !sk.isEmpty else { return out }
+        let now = Date().timeIntervalSince1970
+        guard let s = shows[sk] else {
+            search(show, sk, done)
+            return out
+        }
+        out.showimage = s["image"] as? String
+        guard let id = s["id"] as? Int, id > 0 else {
+            // no match last time, try again after a week
+            if now - (s["checked"] as? Double ?? 0) > 7 * 86400 { search(show, sk, done) }
+            return out
+        }
+        let e = episodes[String(id)]
+        if let m = (e?["list"] as? [String: [String: Any]])?[tvnorm(episode)] {
+            out.season = m["s"] as? Int
+            out.number = m["e"] as? Int
+            out.episodeimage = m["i"] as? String
+            return out
+        }
+        if e == nil || now - (e?["fetched"] as? Double ?? 0) > 86400 { episodelist(id, done) }
+        return out
+    }
+
+    func start(_ job: String) -> Bool {
+        guard !busy.contains(job), Date() >= (retry[job] ?? .distantPast) else { return false }
+        busy.insert(job)
+        return true
+    }
+
+    func search(_ name: String, _ key: String, _ done: @escaping () -> Void) {
+        let job = "s:" + key
+        guard start(job) else { return }
+        logger.info("tvmaze: searching for \(name)")
+        let q = name.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? ""
+        get("/search/shows?q=" + q) { [self] obj in
+            busy.remove(job)
+            guard let list = obj as? [[String: Any]] else {
+                logger.warn("tvmaze: search failed for \(name), trying again in 10 minutes")
+                retry[job] = Date().addingTimeInterval(600)
+                return
+            }
+            var entry: [String: Any] = ["id": 0, "checked": Date().timeIntervalSince1970]
+            // only an exact name match counts, a wrong show is worse than no artwork
+            for r in list {
+                guard let s = r["show"] as? [String: Any], let n = s["name"] as? String, tvnorm(n) == key, let id = s["id"] as? Int else { continue }
+                entry["id"] = id
+                if let img = tvimage(s["image"]) { entry["image"] = img }
+                break
+            }
+            logger.info("tvmaze: \((entry["id"] as? Int ?? 0) > 0 ? "matched" : "no match for") \(name)")
+            shows[key] = entry
+            save()
+            done()
+        }
+    }
+
+    func episodelist(_ id: Int, _ done: @escaping () -> Void) {
+        let job = "e:\(id)"
+        guard start(job) else { return }
+        logger.info("tvmaze: fetching episodes for show \(id)")
+        get("/shows/\(id)/episodes") { [self] obj in
+            busy.remove(job)
+            guard let list = obj as? [[String: Any]] else {
+                logger.warn("tvmaze: episode list failed for show \(id), trying again in 10 minutes")
+                retry[job] = Date().addingTimeInterval(600)
+                return
+            }
+            var map: [String: [String: Any]] = [:]
+            for e in list {
+                guard let n = e["name"] as? String, let s = e["season"] as? Int, let num = e["number"] as? Int else { continue }
+                let k = tvnorm(n)
+                if k.isEmpty || map[k] != nil { continue }
+                var m: [String: Any] = ["s": s, "e": num]
+                if let img = tvimage(e["image"]) { m["i"] = img }
+                map[k] = m
+            }
+            episodes[String(id)] = ["fetched": Date().timeIntervalSince1970, "list": map]
+            save()
+            done()
+        }
+    }
+}
+
+// runs the osascript adapter while the apple tv app is open and keeps the latest playback from it
+final class tvwatch {
+    var proc: Process?
+    var buf = Data()
+    var state: tvstate?
+    var status = "starting"
+    var unavailable: String?
+    var fails = 0
+    var started = Date.distantPast
+    var retry = Date.distantPast
+    var lastdetail = ""
+    var lastkey = ""
+    var onchange: (() -> Void)?
+
+    func reset() {
+        unavailable = nil
+        fails = 0
+        retry = .distantPast
+    }
+
+    func start() {
+        guard proc == nil, unavailable == nil, Date() >= retry else { return }
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        p.arguments = ["-l", "JavaScript", "-e", tvscript(once: false)]
+        let out = Pipe(), err = Pipe()
+        p.standardOutput = out
+        p.standardError = err
+        out.fileHandleForReading.readabilityHandler = { [weak self] h in
+            let d = h.availableData
+            if d.isEmpty { h.readabilityHandler = nil; return }
+            DispatchQueue.main.async { self?.feed(d) }
+        }
+        err.fileHandleForReading.readabilityHandler = { h in
+            let d = h.availableData
+            if d.isEmpty { h.readabilityHandler = nil; return }
+            if let s = String(data: d, encoding: .utf8) { logger.warn("apple tv adapter: \(s.trimmingCharacters(in: .whitespacesAndNewlines).prefix(300))") }
+        }
+        p.terminationHandler = { [weak self] q in DispatchQueue.main.async { self?.ended(q) } }
+        do {
+            try p.run()
+        } catch {
+            unavailable = "could not start osascript"
+            logger.error("apple tv adapter: could not start osascript: \(error.localizedDescription)")
+            return
+        }
+        proc = p
+        started = Date()
+        status = "waiting for playback"
+        logger.info("apple tv adapter started")
+    }
+
+    func stop() {
+        guard let p = proc else { return }
+        proc = nil
+        p.terminationHandler = nil
+        p.terminate()
+        buf = Data()
+        state = nil
+        lastkey = ""
+        logger.info("apple tv adapter stopped")
+    }
+
+    func ended(_ q: Process) {
+        guard q === proc else { return }
+        proc = nil
+        state = nil
+        fails = Date().timeIntervalSince(started) < 10 ? fails + 1 : 0
+        logger.warn("apple tv adapter exited (status \(q.terminationStatus))")
+        if unavailable == nil {
+            if fails >= 3 {
+                unavailable = "the adapter keeps exiting, see the log"
+            } else {
+                retry = Date().addingTimeInterval(5)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 5.5) { [weak self] in self?.onchange?() }
+            }
+        }
+        onchange?()
+    }
+
+    func feed(_ d: Data) {
+        buf.append(d)
+        while let nl = buf.firstIndex(of: 10) {
+            let line = buf.subdata(in: buf.startIndex..<nl)
+            buf.removeSubrange(buf.startIndex...nl)
+            if let s = String(data: line, encoding: .utf8) { got(s) }
+        }
+    }
+
+    func got(_ line: String) {
+        guard let d = line.data(using: .utf8), let o = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any] else { return }
+        if let e = o["error"] as? String {
+            unavailable = e
+            state = nil
+            logger.error("apple tv adapter: \(e)")
+        } else if let how = o["ready"] as? String {
+            logger.info("apple tv adapter ready (\(how))")
+            return
+        } else if o["none"] != nil {
+            state = nil
+            status = "waiting for playback"
+            if let dt = o["detail"] as? String, dt != lastdetail {
+                lastdetail = dt
+                logger.info("apple tv adapter: nothing readable: \(dt)")
+            }
+        } else if let b = o["bundle"] as? String, b == tvbundle {
+            var s = tvstate()
+            s.show = o["show"] as? String ?? ""
+            s.title = o["title"] as? String ?? ""
+            s.elapsed = o["elapsed"] as? Double ?? 0
+            s.duration = o["duration"] as? Double ?? 0
+            s.rate = o["rate"] as? Double ?? 0
+            s.stamp = o["stamp"] as? Double ?? Date().timeIntervalSince1970
+            s.release = o["release"] as? Double ?? 0
+            state = s
+            status = "reading playback"
+            let key = s.show + "|" + s.title
+            if key != lastkey {
+                lastkey = key
+                logger.info("apple tv playing: \(s.show.isEmpty ? s.title : s.show + " - " + s.title)")
+            }
+        } else {
+            state = nil
+            status = "ignoring playback from \(o["bundle"] as? String ?? "another app")"
+        }
+        onchange?()
+    }
+}
+
 // minimal discord ipc: unix socket, 8 byte header (opcode + length, little endian) then json
 final class ipc {
     var fd: Int32 = -1
@@ -296,6 +670,13 @@ final class furrpc: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTableView
     var running: [String] = []
     var rows: [approw] = []
     var tempwarned = false
+    let tv = tvwatch()
+    let maze = tvmaze()
+    var tvchecks: [NSButton] = []
+    var tvidfield: NSTextField!
+    var tvimagefield: NSTextField!
+    var tvtexts: [NSTextField] = []
+    var tvstatus: NSTextField?
 
     func applicationDidFinishLaunching(_ n: Notification) {
         logger.info("furrpc started, \(hwline)")
@@ -309,8 +690,13 @@ final class furrpc: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTableView
             NSWorkspace.shared.notificationCenter.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in self?.refresh() }
         }
         DistributedNotificationCenter.default().addObserver(forName: .init("furrpc.reload"), object: nil, queue: .main) { [weak self] _ in self?.reload() }
+        tv.onchange = { [weak self] in self?.refresh() }
         reload()
         if apps.isEmpty { showwindow() }
+    }
+
+    func applicationWillTerminate(_ n: Notification) {
+        tv.stop()
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
@@ -322,6 +708,7 @@ final class furrpc: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTableView
         logger.info("reloading")
         loadcfg()
         games = loadgames()
+        tv.reset()
         rpc.drop()
         if flag("menubar") {
             if item == nil { makeitem() }
@@ -343,11 +730,114 @@ final class furrpc: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTableView
         return nil
     }
 
+    // the apple tv adapter only runs while the apple tv app is open and the option is on
+    func tvsync() {
+        let open = NSRunningApplication.runningApplications(withBundleIdentifier: tvbundle).contains { !$0.isTerminated }
+        if tvon && open { tv.start() } else { tv.stop() }
+    }
+
+    func updatetvstatus() {
+        guard let l = tvstatus else { return }
+        var s = "off"
+        if tvon {
+            if let u = tv.unavailable {
+                s = "unavailable: \(u)"
+            } else if !NSRunningApplication.runningApplications(withBundleIdentifier: tvbundle).contains(where: { !$0.isTerminated }) {
+                s = "waiting for the apple tv app to open"
+            } else {
+                s = tv.status
+            }
+        }
+        l.stringValue = "status: " + s
+    }
+
+    // the watching presence for what the apple tv app plays right now, nil when there is nothing to show.
+    // the name and both lines can be changed in the apple tv tab, these are the defaults
+    func tvactivity() -> [String: Any]? {
+        guard tvon, let s = tv.state else { return nil }
+        let paused = s.rate <= 0
+        if paused && !flag("appletv_paused") { return nil }
+        var info: tvinfo?
+        if flag("appletv_tvmaze") && !s.show.isEmpty {
+            info = maze.lookup(show: s.show, episode: s.title) { [weak self] in self?.refresh() }
+        }
+        // no show name means a movie
+        let movie = s.show.isEmpty
+        var vals: [String: String] = ["show": (movie ? s.title : s.show).lowercased(), "title": s.title.lowercased(),
+                                      "se": "", "season": "", "episode": "", "release": ""]
+        if let se = info?.season, let ep = info?.number {
+            vals["season"] = String(format: "%02ld", se)
+            vals["episode"] = String(format: "%02ld", ep)
+            vals["se"] = String(format: "s%02ld e%02ld", se, ep)
+        }
+        if movie && s.release > 0 {
+            let f = DateFormatter()
+            f.locale = Locale(identifier: "en_US_POSIX")
+            f.timeZone = TimeZone(identifier: "UTC")
+            f.dateFormat = "MMM d, yyyy"
+            vals["release"] = f.string(from: Date(timeIntervalSince1970: s.release)).lowercased()
+        }
+        // text typed in the tab is used as written, only the {tokens} are replaced. leftover separators are trimmed
+        func text(_ key: String, _ def: String) -> String {
+            var t = cfg[key] as? String ?? ""
+            if t.isEmpty { t = def }
+            for (k, v) in vals { t = t.replacingOccurrences(of: "{\(k)}", with: v) }
+            return t.trimmingCharacters(in: CharacterSet(charactersIn: " ·"))
+        }
+        var name = text("appletv_name", "apple tv")
+        if name.isEmpty { name = "apple tv" }
+        let first = String(text("appletv_line1", "{show}").prefix(128))
+        var second = text(movie ? "appletv_movie" : "appletv_line2", movie ? "{release}" : "{se} · {title}")
+        if paused { second = second.isEmpty ? "paused" : second + " · paused" }
+        let mine = cfg["appletv_image"] as? String
+        let image = info?.episodeimage ?? info?.showimage ?? ((mine?.isEmpty ?? true) ? nil : mine) ?? fallbackimage
+        var act: [String: Any] = [
+            "name": name,
+            "type": 3,
+            "assets": ["large_image": image, "large_text": first.isEmpty ? name : first],
+        ]
+        if !first.isEmpty { act["details"] = first }
+        if !second.isEmpty { act["state"] = String(second.prefix(128)) }
+        // discord draws the bar from these two times and keeps it moving by itself, so nothing is resent while the
+        // playback just runs. start = when the position was 0. while paused the bar carries on (discord cannot freeze
+        // it) and jumps to the right place as soon as playback resumes
+        if flag("appletv_progress") && s.duration > 0 {
+            let start = Int((s.stamp - s.elapsed).rounded())
+            act["timestamps"] = ["start": start, "end": start + Int(s.duration.rounded())]
+        }
+        return act
+    }
+
+    func showtv(_ act: [String: Any]) {
+        let own = cfg["appletv_client_id"] as? String
+        let cid = (own?.isEmpty ?? true) ? clientid : own!
+        if rpc.connected && rpc.cid != cid {
+            logger.info("client id changed, reconnecting")
+            rpc.drop()
+        }
+        rpc.connect(cid)
+        rpc.set(act)
+        // playback changes arrive as events, this only retries a missing discord connection
+        let t = Timer(timeInterval: 60, repeats: true) { [weak self] _ in self?.refresh() }
+        t.tolerance = 15
+        RunLoop.main.add(t, forMode: .common)
+        timer = t
+    }
+
     func refresh() {
+        tvsync()
+        updatetvstatus()
         // opening our own window should not wipe the presence
         if NSWorkspace.shared.frontmostApplication?.processIdentifier == getpid() { return }
         timer?.invalidate()
         timer = nil
+        // a listed app in front always wins, otherwise what apple tv is playing is shown
+        let front = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
+        let frontlisted = front.map { apps.contains($0) && !disabled.contains($0) } ?? false
+        if !frontlisted, let act = tvactivity() {
+            showtv(act)
+            return
+        }
         guard let a = target(), let id = a.bundleIdentifier else {
             rpc.set(nil)
             return
@@ -551,6 +1041,50 @@ final class furrpc: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTableView
         fh.textColor = .secondaryLabelColor
         place(fh, 170, ch - 233, cw - 182, 16, in: sv)
 
+        // tab 4: apple tv
+        let tvv = tab("apple tv")
+        let tvhead = NSTextField(labelWithString: "show what the apple tv app is playing in discord, as a watching presence.")
+        tvhead.font = .systemFont(ofSize: 11)
+        tvhead.textColor = .secondaryLabelColor
+        place(tvhead, 12, ch - 28, cw - 24, 16, in: tvv)
+        let tvtitles = ["enable apple tv presence", "enable tvmaze lookups (season, episode number and artwork)", "progress bar", "keep showing while paused (the progress bar keeps running)"]
+        for (n, title) in tvtitles.enumerated() {
+            let b = NSButton(checkboxWithTitle: title, target: nil, action: nil)
+            place(b, 12, ch - 56 - CGFloat(n * 24), cw - 24, 20, in: tvv)
+            tvchecks.append(b)
+        }
+        tvidfield = NSTextField(string: "")
+        tvimagefield = NSTextField(string: "")
+        tvtexts = (0..<4).map { _ in NSTextField(string: "") }
+        let tvrows: [(String, NSTextField, String)] = [
+            ("apple tv client id", tvidfield, "default (settings tab)"),
+            ("fallback image", tvimagefield, "default image (url or asset name)"),
+            ("presence name", tvtexts[0], "apple tv"),
+            ("line 1", tvtexts[1], "{show}"),
+            ("line 2 (shows)", tvtexts[2], "{se} · {title}"),
+            ("line 2 (movies)", tvtexts[3], "{release}"),
+        ]
+        for (n, r) in tvrows.enumerated() {
+            let y = ch - 166 - CGFloat(n * 30)
+            let l = NSTextField(labelWithString: r.0)
+            l.font = .boldSystemFont(ofSize: 12)
+            place(l, 12, y + 3, 130, 17, in: tvv)
+            r.1.placeholderString = r.2
+            place(r.1, 146, y, cw - 158, 22, in: tvv)
+        }
+        let tvhint = NSTextField(labelWithString: "blank uses the default. text can use {show} {title} {se} {season} {episode} {release}.")
+        tvhint.font = .systemFont(ofSize: 11)
+        tvhint.textColor = .secondaryLabelColor
+        place(tvhint, 12, ch - 340, cw - 24, 16, in: tvv)
+        let tvs = NSTextField(labelWithString: "")
+        tvs.lineBreakMode = .byTruncatingTail
+        place(tvs, 12, ch - 364, cw - 24, 17, in: tvv)
+        tvstatus = tvs
+        let credit = NSTextField(labelWithAttributedString: tvcredit())
+        credit.allowsEditingTextAttributes = true
+        credit.isSelectable = true
+        place(credit, 12, 8, cw - 24, 16, in: tvv)
+
         // bottom bar
         status = NSTextField(labelWithString: "")
         status.textColor = .secondaryLabelColor
@@ -559,6 +1093,18 @@ final class furrpc: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTableView
         save.keyEquivalent = "\r"
         place(save, W - 20 - 100, 16, 100, 30, in: v)
         win = w
+    }
+
+    // tvmaze data is cc by-sa 4.0, so the tab links to the source and the license
+    func tvcredit() -> NSAttributedString {
+        let out = NSMutableAttributedString(string: "episode data from tvmaze.com, licensed cc by-sa 4.0", attributes: [
+            .font: NSFont.systemFont(ofSize: 11),
+            .foregroundColor: NSColor.secondaryLabelColor,
+        ])
+        let s = out.string as NSString
+        out.addAttribute(.link, value: URL(string: "https://www.tvmaze.com")!, range: s.range(of: "tvmaze.com"))
+        out.addAttribute(.link, value: URL(string: "https://creativecommons.org/licenses/by-sa/4.0/")!, range: s.range(of: "cc by-sa 4.0"))
+        return out
     }
 
     // the github icon is black on transparent. invert the colors (black becomes white) and keep the alpha
@@ -814,6 +1360,14 @@ final class furrpc: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTableView
         checks[1].state = flag("menubar") ? .on : .off
         checks[2].state = loginon ? .on : .off
         checks[3].state = flagoff("background") ? .on : .off
+        tvchecks[0].state = tvon ? .on : .off
+        tvchecks[1].state = flag("appletv_tvmaze") ? .on : .off
+        tvchecks[2].state = flag("appletv_progress") ? .on : .off
+        tvchecks[3].state = flag("appletv_paused") ? .on : .off
+        tvidfield.stringValue = cfg["appletv_client_id"] as? String ?? ""
+        tvimagefield.stringValue = cfg["appletv_image"] as? String ?? ""
+        for (n, k) in tvtextkeys.enumerated() { tvtexts[n].stringValue = cfg[k] as? String ?? "" }
+        updatetvstatus()
         let off = disabled
         rows = apps.map { id in
             let o = overrides[id] ?? [:]
@@ -841,6 +1395,13 @@ final class furrpc: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTableView
             alert(m)
             return
         }
+        let tid = tvidfield.stringValue.trimmingCharacters(in: .whitespaces)
+        let timg = tvimagefield.stringValue.trimmingCharacters(in: .whitespaces)
+        if let m = checkclient(tid) ?? checkimage(timg) {
+            tabs.selectTabViewItem(at: 3)
+            alert(m)
+            return
+        }
         apps = rows.map { $0.id }
         disabled = rows.filter { !$0.enabled }.map { $0.id }
         var o: [String: [String: String]] = [:]
@@ -856,6 +1417,16 @@ final class furrpc: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTableView
         cfg["temperature"] = checks[0].state == .on
         cfg["menubar"] = checks[1].state == .on
         cfg["background"] = checks[3].state == .on
+        cfg["appletv"] = tvchecks[0].state == .on
+        cfg["appletv_tvmaze"] = tvchecks[1].state == .on
+        cfg["appletv_progress"] = tvchecks[2].state == .on
+        cfg["appletv_paused"] = tvchecks[3].state == .on
+        if tid.isEmpty { cfg.removeValue(forKey: "appletv_client_id") } else { cfg["appletv_client_id"] = tid }
+        if timg.isEmpty { cfg.removeValue(forKey: "appletv_image") } else { cfg["appletv_image"] = timg }
+        for (n, k) in tvtextkeys.enumerated() {
+            let t = tvtexts[n].stringValue.trimmingCharacters(in: .whitespaces)
+            if t.isEmpty { cfg.removeValue(forKey: k) } else { cfg[k] = t }
+        }
         savecfg()
         setlogin(checks[2].state == .on)
         reload()
@@ -865,6 +1436,21 @@ final class furrpc: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTableView
 }
 
 func onoff(_ b: Bool) -> String { b ? "on" : "off" }
+
+// runs the adapter once in the foreground and prints its raw json, to check what macos lets osascript read.
+// play something in the apple tv app first. "bundle" should be com.apple.TV
+func tvtest() {
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+    p.arguments = ["-l", "JavaScript", "-e", tvscript(once: true)]
+    do { try p.run() } catch {
+        print("could not start osascript: \(error.localizedDescription)")
+        return
+    }
+    DispatchQueue.global().asyncAfter(deadline: .now() + 10) { if p.isRunning { p.terminate() } }
+    p.waitUntilExit()
+    print("osascript exit status: \(p.terminationStatus)")
+}
 
 func runcli(_ a: [String]) {
     loadcfg()
@@ -879,6 +1465,14 @@ func runcli(_ a: [String]) {
       set login on|off          start at login
       set id <application id>   use another discord application
       set background on|off     show even when the app is not in front
+      set appletv on|off        show what the apple tv app is playing
+      set tvmaze on|off         look up season, episode number and artwork on tvmaze
+      set tvprogress on|off     show the progress bar
+      set tvpaused on|off       keep showing while paused
+      set tvid <application id>|default    apple tv discord application (default uses the main one)
+      set tvimage <url>|default            apple tv fallback image url or asset name
+      set tvname|tvline1|tvline2|tvmovie <text>|default    apple tv presence name and lines, {show} {title} {se} {season} {episode} {release}
+      appletv test              read the apple tv playback once and print what macos returns
       enable <bundle id>        turn an app on
       disable <bundle id>       turn an app off without removing it
       set name <bundle id> [name]     change the name shown in discord (no name resets it)
@@ -914,6 +1508,32 @@ func runcli(_ a: [String]) {
         case "menubar": cfg["menubar"] = val == "on"
         case "login": setlogin(val == "on")
         case "background": cfg["background"] = val == "on"
+        case "appletv": cfg["appletv"] = val == "on"
+        case "tvmaze": cfg["appletv_tvmaze"] = val == "on"
+        case "tvprogress": cfg["appletv_progress"] = val == "on"
+        case "tvpaused": cfg["appletv_paused"] = val == "on"
+        case "tvid":
+            if val == "default" {
+                cfg.removeValue(forKey: "appletv_client_id")
+            } else if val.allSatisfy({ $0.isASCII && $0.isNumber }) {
+                cfg["appletv_client_id"] = val
+            } else {
+                print("a client id is a long number, digits only")
+                changed = false
+            }
+        case "tvname", "tvline1", "tvline2", "tvmovie":
+            let key = ["tvname": "appletv_name", "tvline1": "appletv_line1", "tvline2": "appletv_line2", "tvmovie": "appletv_movie"][arg]!
+            let text = a.dropFirst(2).joined(separator: " ")
+            if text == "default" { cfg.removeValue(forKey: key) } else { cfg[key] = text }
+        case "tvimage":
+            if val == "default" {
+                cfg.removeValue(forKey: "appletv_image")
+            } else if val.contains(" ") {
+                print("an image url or asset name has no spaces")
+                changed = false
+            } else {
+                cfg["appletv_image"] = val
+            }
         case "name", "image", "appid":
             // furrpc set name <bundle id> <name...>, an empty value removes the customization
             let key = arg == "appid" ? "client_id" : arg
@@ -926,6 +1546,9 @@ func runcli(_ a: [String]) {
         case "id": cfg["client_id"] = val
         default: print(usage); changed = false
         }
+    case "appletv" where arg == "test":
+        tvtest()
+        changed = false
     case "log":
         print(logurl.path)
         let n = Int(arg) ?? 40
@@ -944,6 +1567,13 @@ func runcli(_ a: [String]) {
         print("disabled: \(disabled.count)")
         print("customized: \(overrides.count)")
         print("id: \(clientid)")
+        print("appletv: \(onoff(tvon))")
+        print("tvmaze: \(onoff(flag("appletv_tvmaze")))")
+        print("tvprogress: \(onoff(flag("appletv_progress")))")
+        print("tvpaused: \(onoff(flag("appletv_paused")))")
+        print("tvid: \(cfg["appletv_client_id"] as? String ?? "default")")
+        print("tvimage: \(cfg["appletv_image"] as? String ?? "default")")
+        for (n, k) in ["tvname", "tvline1", "tvline2", "tvmovie"].enumerated() { print("\(k): \(cfg[tvtextkeys[n]] as? String ?? "default")") }
         changed = false
     default:
         print(usage)

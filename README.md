@@ -19,7 +19,9 @@ it shows:
 * your mac temperature with one decimal (like `45.3°c`), updated every 5 seconds (when the mac allows reading it)
 * your mac model and chip, like `macbook pro 14' - apple m5` (you can show the model id, like `mac17,2`, instead)
 
-**jump to:** [install](#install) · [first launch](#first-launch-macos-blocks-the-app) · [setup](#setup) · [use](#use) · [updates](#updates) · [configure](#configure) · [games.json](#gamesjson) · [command line](#command-line) · [logging](#logging) · [uninstall](#uninstall) · [license](#license)
+it can also show what you are watching in the apple tv app, as a discord watching presence with the show, season and episode, and a live progress bar. see [apple tv](#apple-tv).
+
+**jump to:** [install](#install) · [first launch](#first-launch-macos-blocks-the-app) · [setup](#setup) · [use](#use) · [apple tv](#apple-tv) · [updates](#updates) · [configure](#configure) · [games.json](#gamesjson) · [command line](#command-line) · [logging](#logging) · [uninstall](#uninstall) · [license](#license)
 
 ---
 
@@ -107,11 +109,76 @@ press **save** at the bottom right. that is it.
 
 ## use
 
-the window has three tabs: **setup** (the steps above), **apps** (a table where every app has its own on/off checkbox, edit and remove) and **settings**. changes apply when you press **save**.
+the window has four tabs: **setup** (the steps above), **apps** (a table where every app has its own on/off checkbox, edit and remove), **settings** and **apple tv**. changes apply when you press **save**.
 
 the time played is how long the game itself has been open, not how long furrpc has been running.
 
 furrpc starts by itself when you log in. after that it lives in the menu bar as `:3`. click it and choose **open furrpc** to change things. you can turn the menu bar item and start at login off in the settings tab.
+
+---
+
+## apple tv
+
+furrpc can show what is playing in the macos apple tv app as a discord **watching** presence. it is off by default.
+
+```
+watching apple tv
+severance
+s01 e01 · in perpetuity
+```
+
+for a movie the second line is its release date, when macos reports one.
+
+### how to enable it
+
+1. open the **apple tv** tab and tick **enable apple tv presence**, then press **save**. or run `furrpc set appletv on`
+2. optional: give it its own discord application in **apple tv client id** (blank uses the default client id) and set a **fallback image** (an https url or an asset name)
+3. play something in the apple tv app
+
+a listed app or game that is in front always wins over apple tv. apple tv is only shown when no listed app is in front.
+
+### settings
+
+| setting | what it does |
+| --- | --- |
+| enable apple tv presence | turns the whole feature on or off. off by default |
+| enable tvmaze lookups | adds season and episode number (`s01 e01`) and artwork from tvmaze. off means only what macos reports is used |
+| progress bar | sends the start and end time so discord draws a live progress bar. off shows no timer at all |
+| keep showing while paused | on keeps the presence up with `paused` added to the second line, and the progress bar keeps running. off clears the whole presence while paused |
+| apple tv client id | the discord application used for apple tv, blank uses the default client id |
+| fallback image | used when tvmaze has no artwork. blank uses the default image |
+| presence name, line 1, line 2 (shows), line 2 (movies) | what discord shows. the defaults are `apple tv`, `{show}`, `{se} · {title}` and `{release}`. blank uses the default |
+
+the show and episode names are shown in lowercase. in the text settings you can use `{show}` (the movie title for movies), `{title}`, `{se}` (like `s01 e01`), `{season}`, `{episode}` and `{release}`. tokens are filled in lowercase, the rest of the text stays as you typed it, and a separator left over from an empty token is trimmed.
+
+the artwork order is the episode picture from tvmaze, then the show picture, then your fallback image, then the default image.
+
+the progress bar is drawn by discord itself from the position macos reports, so furrpc does not update the presence every second. it only updates when you play, pause, seek or change episode. discord cannot freeze a bar, so with **keep showing while paused** on the bar keeps running while you are paused and jumps to the real position when you press play. turn that setting off to clear the presence while paused.
+
+```sh
+furrpc set appletv on         # or off
+furrpc set tvmaze on          # or off
+furrpc set tvprogress on      # or off
+furrpc set tvpaused on        # or off
+furrpc set tvline2 "{se} - {title}"   # also tvname, tvline1, tvmovie. "default" resets
+furrpc set tvid 123456789012345678
+furrpc set tvimage https://files.catbox.moe/xxxxxx.png   # "default" resets tvid and tvimage
+furrpc appletv test           # reads the current playback once and prints what macos returns
+```
+
+### where the playback comes from
+
+the apple tv app has no api for this, and its applescript dictionary is not reliable, so furrpc reads what macos itself reports as now playing (the same info the media keys and control center use). only playback that belongs to `com.apple.TV` is used. the show name is macos' album, the episode name is its title. furrpc does not look at the video or any files.
+
+macos only lets apple-signed processes read that information, and furrpc is not signed by apple, so it cannot ask directly. while the apple tv app is open, furrpc runs one small `osascript` (javascript for automation) child process that reads it and prints a line when something changes. it reacts to macos notifications, with a slow safety check every 15 seconds, and it stops when the apple tv app closes.
+
+**compatibility:** this depends on macos still letting an apple-signed process read now playing info. if your macos version blocks that too, the apple tv tab says `unavailable` and the reason is in the log. `furrpc appletv test` shows the raw result so you can check what your mac returns. furrpc does not try to work around a block.
+
+### tvmaze
+
+with **enable tvmaze lookups** on, furrpc sends the show name to tvmaze once per show to find it, then downloads that show's episode list once, matches the episode title and keeps the result in `~/Library/Application Support/furrpc/appletv-cache.json`. the same episode never asks again. if tvmaze is off, unreachable, or the show or episode does not match, the presence still works with the macos data. only an exact show name match is used, so a wrong show never gets shown.
+
+episode data and artwork come from [tvmaze.com](https://www.tvmaze.com) and are licensed [cc by-sa 4.0](https://creativecommons.org/licenses/by-sa/4.0/).
 
 ---
 
@@ -120,7 +187,7 @@ furrpc starts by itself when you log in. after that it lives in the menu bar as 
 to update, run the **build** workflow in your fork again (sync your fork first if the original repo has changes), download the new `furrpc.app` and replace the one in **applications**. your settings and your own `games.json` stay where they are, so nothing is lost.
 
 * your own changes always win: what you set in the **apps** tab is read on top of your local `games.json` (see below)
-* furrpc never downloads `games.json` or anything else by itself
+* furrpc never downloads `games.json` or updates itself. the only thing it ever fetches is tvmaze data, and only if you turn that on in the apple tv tab
 
 ---
 
@@ -216,6 +283,14 @@ furrpc set menubar on                # or off
 furrpc set login on                  # or off
 furrpc set background on             # or off
 furrpc set macname on                # or off (off shows the model id like mac17,2)
+furrpc set appletv on                # or off, show what the apple tv app plays
+furrpc set tvmaze on                 # or off, season, episode number and artwork
+furrpc set tvprogress on             # or off
+furrpc set tvpaused on               # or off
+furrpc set tvline2 "{se} - {title}"   # also tvname, tvline1, tvmovie ("default" resets)
+furrpc set tvid 123456789012345678   # apple tv discord application ("default" resets)
+furrpc set tvimage https://files.catbox.moe/xxxxxx.png   # apple tv fallback image ("default" resets)
+furrpc appletv test                  # prints what macos returns for the current apple tv playback
 furrpc set id 123456789012345678     # use your own discord application
 furrpc enable com.example.game       # turn an app on
 furrpc disable com.example.game      # turn an app off, keep it in the list
@@ -243,9 +318,9 @@ furrpc log
 furrpc log 200
 ```
 
-* it records start up, config changes, which games.json files were read, when discord connects or disconnects, when a presence is set or cleared, and any errors
+* it records start up, config changes, which games.json files were read, when discord connects or disconnects, when a presence is set or cleared, apple tv and tvmaze activity, and any errors
 * when the file passes 512 kb it is moved to `furrpc.log.old` and a new one starts, so it never grows forever
-* the log only stays on your mac. furrpc downloads nothing and sends nothing about you anywhere except the presence it hands to your own discord app
+* the log only stays on your mac. furrpc sends nothing about you anywhere except the presence it hands to your own discord app and, if you turn on tvmaze lookups, the name of the show you are watching to tvmaze
 
 if something is not working, look for **discord ipc socket not found** in the log. it means discord is not open.
 
@@ -264,6 +339,7 @@ this removes everything furrpc puts on your mac. paste the commands into termina
 | settings | `~/Library/Application Support/furrpc/config.json` |
 | logs | `~/Library/Application Support/furrpc/furrpc.log` and `furrpc.log.old` |
 | your own `games.json` (only if you made it) | `~/Library/Application Support/furrpc/games.json` |
+| tvmaze cache (only if you used apple tv) | `~/Library/Application Support/furrpc/appletv-cache.json` |
 | start at login item | a login item in system settings |
 | macos leftovers (may exist) | `~/Library/Preferences/com.furrpc.app.plist`, `~/Library/Saved Application State/com.furrpc.app.savedState`, `~/Library/Caches/com.furrpc.app` |
 
