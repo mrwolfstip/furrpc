@@ -149,7 +149,7 @@ a listed app or game that is in front always wins over apple tv. apple tv is onl
 | fallback image | used when tvmaze has no artwork. blank uses the default image |
 | presence name, line 1, line 2 (shows), line 2 (movies) | what discord shows. the defaults are `apple tv`, `{show}`, `{se} · {title}` and `{release}`. blank uses the default |
 
-the show and episode names are shown in lowercase. in the text settings you can use `{show}` (the movie title for movies), `{title}`, `{se}` (like `s01 e01`), `{season}`, `{episode}` and `{release}`. tokens are filled in lowercase, the rest of the text stays as you typed it, and a separator left over from an empty token is trimmed.
+the show and episode names follow the **lowercase text** setting (lowercase by default). in the text settings you can use `{show}` (the movie title for movies), `{title}`, `{se}` (like `s01 e01`), `{season}`, `{episode}` and `{release}`. tokens follow the **lowercase text** setting, the rest of the text stays as you typed it, and a separator left over from an empty token is trimmed.
 
 the artwork order is the episode picture from tvmaze, then the show picture, then your fallback image, then the default image.
 
@@ -205,6 +205,7 @@ everything here is optional. change what you like.
 | menu bar item | show or hide the `:3` in the menu bar |
 | start at login | turn autostart on or off |
 | show even when the app is in the background | keep the presence up while the app is running, even if you are looking at another window |
+| lowercase text | on (default) shows everything furrpc writes in lowercase, for apps, the mac model and apple tv. off uses normal capitalization, like `Severance` and `Apple TV`. names you type yourself are always used as typed |
 | show mac name instead of model id | on shows `macbook pro 14'`, off shows the model id like `mac17,2`. the chip is shown either way |
 
 ### show even when the app is in the background
@@ -282,6 +283,7 @@ furrpc set temp on                   # or off
 furrpc set menubar on                # or off
 furrpc set login on                  # or off
 furrpc set background on             # or off
+furrpc set lowercase on              # or off (off uses normal capitalization)
 furrpc set macname on                # or off (off shows the model id like mac17,2)
 furrpc set appletv on                # or off, show what the apple tv app plays
 furrpc set tvmaze on                 # or off, season, episode number and artwork

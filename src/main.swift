@@ -124,7 +124,10 @@ func sysctlstr(_ key: String) -> String {
     sysctlbyname(key, &buf, &n, nil, 0)
     return String(cString: buf)
 }
-let hwline = "\(sysctlstr("hw.model")) - \(sysctlstr("machdep.cpu.brand_string"))".lowercased()
+let hwraw = "\(sysctlstr("hw.model")) - \(sysctlstr("machdep.cpu.brand_string"))"
+// text furrpc writes itself is lowercase unless "lowercase text" is turned off. names you type are always used as typed
+func cased(_ s: String) -> String { flag("lowercase") ? s.lowercased() : s }
+var hwline: String { cased(hwraw) }
 
 // apple silicon die temperature through the hid sensor api (private symbols, no root needed).
 // returns nil whenever no sane reading exists, so intel macs and odd chips just show no temperature
@@ -763,7 +766,7 @@ final class furrpc: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTableView
         }
         // no show name means a movie
         let movie = s.show.isEmpty
-        var vals: [String: String] = ["show": (movie ? s.title : s.show).lowercased(), "title": s.title.lowercased(),
+        var vals: [String: String] = ["show": cased(movie ? s.title : s.show), "title": cased(s.title),
                                       "se": "", "season": "", "episode": "", "release": ""]
         if let se = info?.season, let ep = info?.number {
             vals["season"] = String(format: "%02ld", se)
@@ -775,20 +778,22 @@ final class furrpc: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTableView
             f.locale = Locale(identifier: "en_US_POSIX")
             f.timeZone = TimeZone(identifier: "UTC")
             f.dateFormat = "MMM d, yyyy"
-            vals["release"] = f.string(from: Date(timeIntervalSince1970: s.release)).lowercased()
+            vals["release"] = cased(f.string(from: Date(timeIntervalSince1970: s.release)))
         }
-        // text typed in the tab is used as written, only the {tokens} are replaced. leftover separators are trimmed
+        // text typed in the tab is used as written, only the {tokens} are replaced (in the case chosen in settings). leftover separators are trimmed
         func text(_ key: String, _ def: String) -> String {
             var t = cfg[key] as? String ?? ""
             if t.isEmpty { t = def }
             for (k, v) in vals { t = t.replacingOccurrences(of: "{\(k)}", with: v) }
             return t.trimmingCharacters(in: CharacterSet(charactersIn: " ·"))
         }
-        var name = text("appletv_name", "apple tv")
-        if name.isEmpty { name = "apple tv" }
+        let tvname = flag("lowercase") ? "apple tv" : "Apple TV"
+        var name = text("appletv_name", tvname)
+        if name.isEmpty { name = tvname }
         let first = String(text("appletv_line1", "{show}").prefix(128))
         var second = text(movie ? "appletv_movie" : "appletv_line2", movie ? "{release}" : "{se} · {title}")
-        if paused { second = second.isEmpty ? "paused" : second + " · paused" }
+        let word = cased("Paused")
+        if paused { second = second.isEmpty ? word : second + " · " + word }
         let mine = cfg["appletv_image"] as? String
         let image = info?.episodeimage ?? info?.showimage ?? ((mine?.isEmpty ?? true) ? nil : mine) ?? fallbackimage
         var act: [String: Any] = [
@@ -852,7 +857,7 @@ final class furrpc: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTableView
             rpc.drop()
         }
         rpc.connect(cid)
-        let name = pick(mine?["name"]) ?? g?["name"] ?? a.localizedName?.lowercased() ?? id
+        let name = pick(mine?["name"]) ?? g?["name"] ?? a.localizedName.map(cased) ?? id
         let image = pick(mine?["image"]) ?? g?["image"] ?? fallbackimage
         var act: [String: Any] = [
             "name": name,
@@ -863,7 +868,7 @@ final class furrpc: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTableView
         let showtemp = flag("temperature")
         if showtemp, let t = readtemp() {
             tempwarned = false
-            act["details"] = "temp \(Int(t.rounded()))°c"
+            act["details"] = cased("temp \(Int(t.rounded()))°C")
             act["state"] = hwline
         } else {
             if showtemp && !tempwarned {
@@ -1029,17 +1034,17 @@ final class furrpc: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTableView
         idhint.font = .systemFont(ofSize: 11)
         idhint.textColor = .secondaryLabelColor
         place(idhint, 12, ch - 78, cw - 24, 16, in: sv)
-        let titles = ["show temperature", "menu bar item", "start at login", "show even when the app is in the background"]
+        let titles = ["show temperature", "menu bar item", "start at login", "show even when the app is in the background", "lowercase text (turn off for normal capitalization)"]
         for (n, title) in titles.enumerated() {
             let b = NSButton(checkboxWithTitle: title, target: nil, action: nil)
             place(b, 12, ch - 116 - CGFloat(n * 26), cw - 24, 20, in: sv)
             checks.append(b)
         }
-        place(NSButton(title: "show local folder", target: self, action: #selector(openfolder)), 12, ch - 238, 150, 26, in: sv)
+        place(NSButton(title: "show local folder", target: self, action: #selector(openfolder)), 12, ch - 264, 150, 26, in: sv)
         let fh = NSTextField(labelWithString: "config.json, furrpc.log and your own games.json live there.")
         fh.font = .systemFont(ofSize: 11)
         fh.textColor = .secondaryLabelColor
-        place(fh, 170, ch - 233, cw - 182, 16, in: sv)
+        place(fh, 170, ch - 259, cw - 182, 16, in: sv)
 
         // tab 4: apple tv
         let tvv = tab("apple tv")
@@ -1360,6 +1365,7 @@ final class furrpc: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTableView
         checks[1].state = flag("menubar") ? .on : .off
         checks[2].state = loginon ? .on : .off
         checks[3].state = flagoff("background") ? .on : .off
+        checks[4].state = flag("lowercase") ? .on : .off
         tvchecks[0].state = tvon ? .on : .off
         tvchecks[1].state = flag("appletv_tvmaze") ? .on : .off
         tvchecks[2].state = flag("appletv_progress") ? .on : .off
@@ -1417,6 +1423,7 @@ final class furrpc: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTableView
         cfg["temperature"] = checks[0].state == .on
         cfg["menubar"] = checks[1].state == .on
         cfg["background"] = checks[3].state == .on
+        cfg["lowercase"] = checks[4].state == .on
         cfg["appletv"] = tvchecks[0].state == .on
         cfg["appletv_tvmaze"] = tvchecks[1].state == .on
         cfg["appletv_progress"] = tvchecks[2].state == .on
@@ -1465,6 +1472,7 @@ func runcli(_ a: [String]) {
       set login on|off          start at login
       set id <application id>   use another discord application
       set background on|off     show even when the app is not in front
+      set lowercase on|off      lowercase text in the presence (off keeps normal capitalization)
       set appletv on|off        show what the apple tv app is playing
       set tvmaze on|off         look up season, episode number and artwork on tvmaze
       set tvprogress on|off     show the progress bar
@@ -1508,6 +1516,7 @@ func runcli(_ a: [String]) {
         case "menubar": cfg["menubar"] = val == "on"
         case "login": setlogin(val == "on")
         case "background": cfg["background"] = val == "on"
+        case "lowercase": cfg["lowercase"] = val == "on"
         case "appletv": cfg["appletv"] = val == "on"
         case "tvmaze": cfg["appletv_tvmaze"] = val == "on"
         case "tvprogress": cfg["appletv_progress"] = val == "on"
@@ -1564,6 +1573,7 @@ func runcli(_ a: [String]) {
         print("menubar: \(onoff(flag("menubar")))")
         print("login: \(onoff(loginon))")
         print("background: \(onoff(flagoff("background")))")
+        print("lowercase: \(onoff(flag("lowercase")))")
         print("disabled: \(disabled.count)")
         print("customized: \(overrides.count)")
         print("id: \(clientid)")
