@@ -48,8 +48,8 @@ xattr -cr $out
 # be silently installed on macOS. manifest.json must be at the root of each archive.
 extbuild=build/extensions
 mkdir -p $extbuild/chromium $extbuild/firefox
-cp browser-extension/background.js browser-extension/content.js $extbuild/chromium/
-cp browser-extension/background.js browser-extension/content.js $extbuild/firefox/
+cp browser-extension/background.js browser-extension/content.js browser-extension/sources.js browser-extension/popup.html browser-extension/popup.css browser-extension/popup.js $extbuild/chromium/
+cp browser-extension/background.js browser-extension/content.js browser-extension/sources.js browser-extension/popup.html browser-extension/popup.css browser-extension/popup.js $extbuild/firefox/
 cp -R browser-extension/icons $extbuild/chromium/
 cp -R browser-extension/icons $extbuild/firefox/
 cp browser-extension/manifest-chromium.json $extbuild/chromium/manifest.json

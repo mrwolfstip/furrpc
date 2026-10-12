@@ -1,17 +1,18 @@
 {
   "manifest_version": 2,
   "name": "furrpc browser media",
-  "version": "1.0.0",
+  "version": "1.2.0",
   "description": "Sends playing browser media to furrpc on this Mac.",
   "icons": {
     "48": "icons/icon-48.png",
     "128": "icons/icon-128.png"
   },
-  "permissions": ["tabs", "<all_urls>", "http://127.0.0.1:49193/*"],
+  "permissions": ["tabs", "storage", "<all_urls>", "http://127.0.0.1:49193/*"],
   "background": { "scripts": ["background.js"] },
+  "browser_action": { "default_popup": "popup.html", "default_title": "configure furrpc sources" },
   "content_scripts": [{
     "matches": ["http://*/*", "https://*/*"],
-    "js": ["content.js"],
+    "js": ["sources.js", "content.js"],
     "run_at": "document_idle"
   }],
   "browser_specific_settings": {

@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>furrpc browser media</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <header>
+    <img src="icons/icon-48.png" alt="">
+    <div><strong>furrpc</strong><small>browser media sources</small></div>
+  </header>
+  <p class="intro">Choose which sites may send currently playing media to the furrpc app on this Mac.</p>
+  <label class="browse-option">
+    <input id="show-browsing" type="checkbox">
+    <span><strong>show while browsing</strong><small>Show the active enabled website even when media is not playing.</small></span>
+  </label>
+  <main id="sources"></main>
+  <form id="add-form">
+    <input id="host" type="text" inputmode="url" placeholder="example.com" aria-label="Website hostname">
+    <button type="submit">add</button>
+  </form>
+  <div id="message" role="status"></div>
+  <footer>
+    <button id="defaults" type="button">restore defaults</button>
+    <span>saved automatically</span>
+  </footer>
+  <script src="sources.js"></script>
+  <script src="popup.js"></script>
+</body>
+</html>

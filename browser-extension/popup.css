@@ -1,0 +1,26 @@
+:root { color-scheme: light dark; font: 13px -apple-system, BlinkMacSystemFont, sans-serif; }
+* { box-sizing: border-box; }
+body { width: 340px; max-height: 520px; margin: 0; color: CanvasText; background: Canvas; }
+header { display: flex; align-items: center; gap: 10px; padding: 14px 14px 10px; border-bottom: 1px solid color-mix(in srgb, CanvasText 18%, transparent); }
+header img { width: 36px; height: 36px; border-radius: 8px; }
+header strong, header small { display: block; }
+header strong { font-size: 16px; }
+header small, .intro, footer span { color: color-mix(in srgb, CanvasText 62%, transparent); }
+.intro { margin: 10px 14px; line-height: 1.35; }
+.browse-option { display: flex; gap: 8px; margin: 10px 14px 12px; align-items: flex-start; cursor: pointer; }
+.browse-option > span, .browse-option strong, .browse-option small { display: block; }
+.browse-option small { margin-top: 2px; line-height: 1.3; color: color-mix(in srgb, CanvasText 62%, transparent); }
+main { max-height: 300px; overflow: auto; border-block: 1px solid color-mix(in srgb, CanvasText 14%, transparent); }
+.section { padding: 8px 14px 4px; font-size: 11px; font-weight: 700; text-transform: uppercase; color: color-mix(in srgb, CanvasText 58%, transparent); }
+.source { min-height: 32px; padding: 5px 14px; display: flex; align-items: center; gap: 8px; }
+.source:hover { background: color-mix(in srgb, AccentColor 10%, transparent); }
+.source label { flex: 1; display: flex; align-items: center; gap: 8px; cursor: pointer; }
+.source small { margin-left: auto; color: color-mix(in srgb, CanvasText 55%, transparent); }
+button, input { font: inherit; }
+button { border: 0; border-radius: 6px; padding: 6px 10px; background: color-mix(in srgb, AccentColor 18%, Canvas); color: CanvasText; cursor: pointer; }
+button:hover { background: color-mix(in srgb, AccentColor 28%, Canvas); }
+.remove { padding: 3px 7px; color: #d33; background: transparent; }
+#add-form { display: flex; gap: 8px; padding: 10px 14px 4px; }
+#host { flex: 1; min-width: 0; padding: 6px 8px; border: 1px solid color-mix(in srgb, CanvasText 25%, transparent); border-radius: 6px; background: Canvas; color: CanvasText; }
+#message { min-height: 20px; padding: 2px 14px; color: #c33; font-size: 11px; }
+footer { display: flex; justify-content: space-between; align-items: center; padding: 6px 14px 12px; font-size: 11px; }

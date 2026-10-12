@@ -649,10 +649,15 @@ final class browserwatch {
                 let lines = head.components(separatedBy: "\r\n")
                 let origin = lines.first(where: { $0.lowercased().hasPrefix("origin:") })?
                     .split(separator: ":", maxSplits: 1).last?.trimmingCharacters(in: .whitespaces) ?? ""
+                // Firefox's extension fetch API omits Origin for requests covered by a
+                // host permission. Chromium sends its chrome-extension:// origin.
+                // Both are safe here: this listener is loopback-only, and a normal web
+                // page cannot read the origin-less response through CORS.
+                let extensionOrigin = origin.hasPrefix("chrome-extension://") || origin.hasPrefix("moz-extension://")
                 if lines.first?.hasPrefix("GET /pair ") == true,
-                   origin.hasPrefix("chrome-extension://") || origin.hasPrefix("moz-extension://") {
+                   origin.isEmpty || extensionOrigin {
                     let data = (try? JSONSerialization.data(withJSONObject: ["key": self.key])) ?? Data("{}".utf8)
-                    self.respond(c, "200 OK", data, origin)
+                    self.respond(c, "200 OK", data, extensionOrigin ? origin : "")
                     return
                 }
                 let length = lines.first(where: { $0.lowercased().hasPrefix("content-length:") })
@@ -661,7 +666,7 @@ final class browserwatch {
                 let authed = lines.contains { $0.lowercased() == "x-furrpc-browser-key: " + self.key.lowercased() }
                 if authed, lines.first?.hasPrefix("POST /media ") == true,
                    let o = try? JSONSerialization.jsonObject(with: Data(body.prefix(length))) as? [String: Any] {
-                    if o["playing"] as? Bool == true {
+                    if o["playing"] as? Bool == true || o["browsing"] as? Bool == true {
                         self.state = o
                         self.stamp = Date()
                         self.status = "tracking \(o["service"] as? String ?? "browser media")"
@@ -1257,19 +1262,25 @@ final class furrpc: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTableView
         let service = cased(s["service"] as? String ?? "Browser Media")
         let title = cased(s["title"] as? String ?? service)
         let kind = s["kind"] as? String ?? "video"
+        let browsing = s["browsing"] as? Bool == true && s["playing"] as? Bool != true
+        let subtitle = cased(s["subtitle"] as? String ?? "")
+        let remoteImage = s["image"] as? String ?? ""
+        let image = (remoteImage.hasPrefix("https://") || remoteImage.hasPrefix("http://")) ? remoteImage : fallbackimage
         var act: [String: Any] = [
             "name": service,
-            "type": kind == "audio" ? 2 : 3,
+            "type": browsing ? 0 : (kind == "audio" ? 2 : 3),
             "details": String(title.prefix(128)),
-            "assets": ["large_image": fallbackimage, "large_text": service],
+            "assets": ["large_image": image, "large_text": title],
         ]
+        if !subtitle.isEmpty { act["state"] = String(subtitle.prefix(128)) }
+        else if browsing { act["state"] = flag("lowercase") ? "browsing" : "Browsing" }
         let position = s["position"] as? Double ?? 0
         let duration = s["duration"] as? Double ?? 0
-        if duration > 0 {
+        if !browsing && duration > 0 {
             let start = Int(Date().timeIntervalSince1970 - position)
             act["timestamps"] = ["start": start, "end": start + Int(duration)]
         }
-        shown = ["name": "\(service) · \(title)", "image": fallbackimage]
+        shown = ["name": "\(service) · \(title)", "image": image]
         stats.set("browser:" + service.lowercased(), service)
         return act
     }

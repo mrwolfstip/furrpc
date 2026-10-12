@@ -215,7 +215,9 @@ open the **browser media** tab and press **install browser extension**. furrpc d
 * firefox: choose **load temporary add-on** and select the shown `manifest.json`; firefox removes temporary add-ons when it closes
 * safari: apple only permits signed safari app extensions, so this local build cannot install one. use firefox or a chromium browser for browser-media tracking
 
-the extension does not send browsing history to furrpc. it reports only a currently playing tab and stops reporting when playback stops. app, apple tv and browser-media time all appear in `/furrpc stats`, whether or not the discord user app is enabled.
+the extension sends the page title, creator or channel name when available, artwork and playback timing to furrpc. youtube uses the channel name as discord's second field. artwork is taken from the page thumbnail, video poster or main visible image, and falls back to the furrpc logo when the site provides none. app, apple tv and browser-media time all appear in `/furrpc stats`, whether or not the discord user app is enabled.
+
+click the extension icon in the browser toolbar to configure sources. common video services (including youtube, netflix, disney+, prime video, max, hulu, paramount+, peacock, crunchyroll, twitch and vimeo) and music services (including youtube music, soundcloud, spotify, apple music, amazon music, tidal, deezer, pandora, bandcamp and mixcloud) are included and enabled by default. each one can be switched off, and any other website can be added by hostname. turn on **show while browsing** to show the active enabled site even when no audio or video is playing; this also lets image-focused and mixed-media pages show their current photo or video thumbnail. it is off by default.
 
 the complete extension source is in `browser-extension`. every build also makes `build/extensions/furrpc-chromium-store.zip` for the chrome web store and `build/extensions/furrpc-firefox-amo.zip` for firefox add-ons. firefox discloses its required `websiteContent` permission because the playing page title is sent to the local furrpc app; it is never sent to a furrpc server.
 
@@ -227,6 +229,22 @@ to update, run the **build** workflow in your fork again (sync your fork first i
 
 * your own changes always win: what you set in the **apps** tab is read on top of your local `games.json` (see below)
 * furrpc never downloads `games.json` or updates itself. the only thing it ever fetches is tvmaze data, and only if you turn that on in the apple tv tab
+
+### publish a release
+
+the included github actions workflow builds the app and both store extension packages on every push. a version tag beginning with `v` also creates a github release and attaches all three downloads automatically.
+
+from the repo folder, replace `v1.2.0` with the next unused version when making a later release:
+
+```sh
+git add .github README.md bot browser-extension build.sh games.json src furrpc.png LICENSE
+git commit -m "add browser artwork and browsing presence"
+git push origin main
+git tag v1.2.0
+git push origin v1.2.0
+```
+
+open the **actions** tab on github to watch the build. when it finishes, the release appears under **releases** with `furrpc.zip`, `furrpc-chromium-store.zip` and `furrpc-firefox-amo.zip` ready to download or upload to their stores.
 
 ---
 

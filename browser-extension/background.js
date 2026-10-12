@@ -23,17 +23,27 @@ async function send(data) {
   } catch (_) { furrpcKey = ""; }
 }
 
+function chosen() {
+  const values = [...tabs.values()];
+  return values.filter(value => value.playing).sort((a, b) => b.stamp - a.stamp)[0]
+    || values.filter(value => value.browsing && value.active).sort((a, b) => b.stamp - a.stamp)[0]
+    || values.filter(value => value.browsing).sort((a, b) => b.stamp - a.stamp)[0];
+}
+
 chrome.runtime.onMessage.addListener((message, sender) => {
   if (message?.type !== "furrpc-media" || sender.tab?.id == null) return;
   const id = sender.tab.id;
-  if (message.data.playing) tabs.set(id, { ...message.data, stamp: Date.now() });
+  if (message.data.playing || message.data.browsing) tabs.set(id, { ...message.data, active: sender.tab.active === true, stamp: Date.now() });
   else tabs.delete(id);
-  const active = [...tabs.values()].sort((a, b) => b.stamp - a.stamp)[0];
-  send(active || { playing: false });
+  send(chosen() || { playing: false, browsing: false });
+});
+
+chrome.tabs.onActivated.addListener(info => {
+  for (const [id, value] of tabs) value.active = id === info.tabId;
+  send(chosen() || { playing: false, browsing: false });
 });
 
 chrome.tabs.onRemoved.addListener(id => {
   if (!tabs.delete(id)) return;
-  const active = [...tabs.values()].sort((a, b) => b.stamp - a.stamp)[0];
-  send(active || { playing: false });
+  send(chosen() || { playing: false, browsing: false });
 });
