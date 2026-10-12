@@ -1,4 +1,6 @@
 import AppKit
+import Network
+import Security
 import ServiceManagement
 
 let defaultid = "1554136413669433354"
@@ -287,6 +289,405 @@ struct tvinfo {
     var number: Int?
     var episodeimage: String?
     var showimage: String?
+}
+
+// discord bot (optional). a small python helper (furrbot.py, with discord.py inside a private venv) talks to discord.
+// furrpc stays the source of truth: it answers three read only requests on 127.0.0.1 and the helper gets nothing else
+let venvdir = supportdir.appendingPathComponent("bot-venv")
+var venvpython: String { venvdir.appendingPathComponent("bin/python3").path }
+var boton: Bool { flagoff("discord_bot") }
+
+// the bot token lives in the keychain, never in config.json and never in the log
+enum tokenstore {
+    static func query() -> [String: Any] {
+        [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: "furrpc discord bot", kSecAttrAccount as String: "token"]
+    }
+    static func has() -> Bool { SecItemCopyMatching(query() as CFDictionary, nil) == errSecSuccess }
+    static func get() -> String? {
+        var q = query()
+        q[kSecReturnData as String] = true
+        q[kSecMatchLimit as String] = kSecMatchLimitOne
+        var out: CFTypeRef?
+        guard SecItemCopyMatching(q as CFDictionary, &out) == errSecSuccess, let d = out as? Data else { return nil }
+        return String(data: d, encoding: .utf8)
+    }
+    static func set(_ t: String) -> Bool {
+        let data = Data(t.utf8)
+        let result = SecItemUpdate(query() as CFDictionary, [kSecValueData as String: data] as CFDictionary)
+        if result == errSecSuccess { return true }
+        guard result == errSecItemNotFound else { return false }
+        var q = query()
+        q[kSecValueData as String] = data
+        return SecItemAdd(q as CFDictionary, nil) == errSecSuccess
+    }
+    static func remove() -> Bool {
+        let result = SecItemDelete(query() as CFDictionary)
+        return result == errSecSuccess || result == errSecItemNotFound
+    }
+}
+
+// discord.py is installed when the venv has it. checked by looking at the folder, so nothing slow runs on the main thread
+func botready() -> Bool {
+    let fm = FileManager.default
+    guard fm.isExecutableFile(atPath: venvpython) else { return false }
+    let lib = venvdir.appendingPathComponent("lib")
+    for d in (try? fm.contentsOfDirectory(atPath: lib.path)) ?? [] where d.hasPrefix("python") {
+        let packages = lib.appendingPathComponent(d).appendingPathComponent("site-packages")
+        guard fm.fileExists(atPath: packages.appendingPathComponent("discord").path) else { continue }
+        let entries = (try? fm.contentsOfDirectory(atPath: packages.path)) ?? []
+        if entries.contains(where: {
+            guard $0.hasPrefix("discord_py-"), $0.hasSuffix(".dist-info") else { return false }
+            let version = $0.dropFirst("discord_py-".count).dropLast(".dist-info".count)
+            let parts = version.split(separator: ".").prefix(2).compactMap { Int($0) }
+            return parts.count == 2 && (parts[0] > 2 || (parts[0] == 2 && parts[1] >= 4))
+        }) { return true }
+    }
+    return false
+}
+
+func runtool(_ exe: String, _ args: [String]) -> (Int32, String) {
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: exe)
+    p.arguments = args
+    let pipe = Pipe()
+    p.standardOutput = pipe
+    p.standardError = pipe
+    do { try p.run() } catch { return (-1, error.localizedDescription) }
+    let d = pipe.fileHandleForReading.readDataToEndOfFile()
+    p.waitUntilExit()
+    return (p.terminationStatus, String(data: d, encoding: .utf8) ?? "")
+}
+
+// a python 3.8+ that can make a venv. /usr/bin/python3 is a stub that pops up the developer tools installer
+// when they are missing, so it is only tried when xcode-select says they are installed
+func findpython() -> String? {
+    var list = ["/opt/homebrew/bin/python3", "/usr/local/bin/python3", "/Library/Frameworks/Python.framework/Versions/Current/bin/python3"]
+    if runtool("/usr/bin/xcode-select", ["-p"]).0 == 0 { list.append("/usr/bin/python3") }
+    for p in list where FileManager.default.isExecutableFile(atPath: p) {
+        if runtool(p, ["-c", "import sys, venv; sys.exit(0 if sys.version_info >= (3, 8) else 1)"]).0 == 0 { return p }
+    }
+    return nil
+}
+
+// sessions and total time for every tracked app/media source, kept locally in stats.json
+final class tracker {
+    let file = supportdir.appendingPathComponent("stats.json")
+    var apps: [String: [String: Any]] = [:]
+    var cur: String?
+    var since = Date()
+
+    init() {
+        let d = (try? JSONSerialization.jsonObject(with: Data(contentsOf: file))) as? [String: Any]
+        apps = d?["apps"] as? [String: [String: Any]] ?? [:]
+    }
+
+    func save() {
+        try? FileManager.default.createDirectory(at: supportdir, withIntermediateDirectories: true)
+        try? JSONSerialization.data(withJSONObject: ["apps": apps], options: [.sortedKeys]).write(to: file)
+    }
+
+    // ends the running session and adds its time. runs when the shown app changes and when furrpc quits
+    func close() {
+        guard let id = cur else { return }
+        var e = apps[id] ?? [:]
+        e["seconds"] = (e["seconds"] as? Double ?? 0) + Date().timeIntervalSince(since)
+        apps[id] = e
+        cur = nil
+        save()
+    }
+
+    func set(_ id: String?, _ name: String) {
+        guard id != cur else { return }
+        close()
+        guard let id = id else { return }
+        var e = apps[id] ?? [:]
+        e["name"] = name
+        e["sessions"] = (e["sessions"] as? Int ?? 0) + 1
+        apps[id] = e
+        cur = id
+        since = Date()
+        save()
+    }
+
+    func snapshot() -> [String: Any] {
+        var list: [[String: Any]] = []
+        for (id, e) in apps {
+            var secs = e["seconds"] as? Double ?? 0
+            if id == cur { secs += Date().timeIntervalSince(since) }
+            list.append(["name": e["name"] as? String ?? id, "sessions": e["sessions"] as? Int ?? 0, "seconds": Int(secs)])
+        }
+        list.sort { ($0["seconds"] as? Int ?? 0) > ($1["seconds"] as? Int ?? 0) }
+        return [
+            "apps": list,
+            "sessions": list.reduce(0) { $0 + ($1["sessions"] as? Int ?? 0) },
+            "seconds": list.reduce(0) { $0 + ($1["seconds"] as? Int ?? 0) },
+        ]
+    }
+}
+
+// the local side of the bot: a tiny http server on 127.0.0.1 (random port, answers only get requests that carry
+// a random key made for this run) and the python helper process. the helper dies with furrpc
+final class botwatch {
+    var proc: Process?
+    var listener: NWListener?
+    var status = "off"
+    var sig = ""
+    var secret = ""
+    var appid = ""
+    var key = ""
+    var answer: ((String) -> [String: Any]?)?
+    var onchange: (() -> Void)?
+
+    func start(token: String, appid: String) {
+        let s = appid + "|" + token
+        if s == sig { return }
+        stop()
+        guard Bundle.main.url(forResource: "furrbot", withExtension: "py") != nil else {
+            status = "helper script missing from the app"
+            logger.error("discord bot: furrbot.py is not in the app")
+            onchange?()
+            return
+        }
+        sig = s
+        secret = token
+        self.appid = appid
+        key = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
+        status = "starting"
+        listen(1)
+        onchange?()
+    }
+
+    func stop() {
+        let p = proc
+        proc = nil
+        p?.terminationHandler = nil
+        p?.terminate()
+        listener?.cancel()
+        listener = nil
+        sig = ""
+        secret = ""
+        status = "off"
+        if p != nil { logger.info("discord bot helper stopped") }
+    }
+
+    func listen(_ attempt: Int) {
+        let port = UInt16.random(in: 49200...64000)
+        let params = NWParameters.tcp
+        params.requiredLocalEndpoint = .hostPort(host: .ipv4(.loopback), port: NWEndpoint.Port(rawValue: port)!)
+        guard let l = try? NWListener(using: params) else {
+            status = "could not open a local port"
+            onchange?()
+            return
+        }
+        l.newConnectionHandler = { [weak self] c in self?.serve(c) }
+        l.stateUpdateHandler = { [weak self, weak l] state in
+            guard let self = self, let l = l, l === self.listener else { return }
+            switch state {
+            case .ready: self.launch(port)
+            case .failed:
+                l.cancel()
+                self.listener = nil
+                if attempt < 5 {
+                    self.listen(attempt + 1)
+                } else {
+                    self.status = "could not open a local port"
+                    self.onchange?()
+                }
+            default: break
+            }
+        }
+        listener = l
+        l.start(queue: .main)
+    }
+
+    // one request, one answer. no key or anything but a known get path gets nothing
+    func serve(_ c: NWConnection) {
+        c.start(queue: .main)
+        c.receive(minimumIncompleteLength: 1, maximumLength: 8192) { [weak self] data, _, _, _ in
+            var code = "403 Forbidden"
+            var body = Data("{}".utf8)
+            if let self = self, let data = data, let text = String(data: data, encoding: .utf8) {
+                let lines = text.components(separatedBy: "\r\n")
+                let first = lines.first?.split(separator: " ") ?? []
+                let authed = lines.contains { $0.lowercased() == "x-furrpc-key: " + self.key }
+                if authed && first.count >= 2 && first[0] == "GET" {
+                    if let obj = self.answer?(String(first[1])), let json = try? JSONSerialization.data(withJSONObject: obj) {
+                        code = "200 OK"
+                        body = json
+                    } else {
+                        code = "404 Not Found"
+                    }
+                }
+            }
+            let head = "HTTP/1.1 \(code)\r\nContent-Type: application/json\r\nContent-Length: \(body.count)\r\nConnection: close\r\n\r\n"
+            c.send(content: Data(head.utf8) + body, completion: .contentProcessed { _ in c.cancel() })
+        }
+    }
+
+    func launch(_ port: UInt16) {
+        guard proc == nil, let script = Bundle.main.url(forResource: "furrbot", withExtension: "py") else { return }
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: venvpython)
+        p.arguments = [script.path]
+        // the token goes in through the environment so it never shows up in the process list
+        p.environment = [
+            "PATH": "/usr/bin:/bin", "HOME": NSHomeDirectory(), "PYTHONDONTWRITEBYTECODE": "1",
+            "FURRPC_PORT": String(port), "FURRPC_KEY": key, "FURRPC_BOT_TOKEN": secret, "FURRPC_BOT_APPID": appid,
+        ]
+        let out = Pipe(), err = Pipe()
+        p.standardOutput = out
+        p.standardError = err
+        let sec = secret
+        out.fileHandleForReading.readabilityHandler = { [weak self] h in
+            let d = h.availableData
+            if d.isEmpty { h.readabilityHandler = nil; return }
+            DispatchQueue.main.async { self?.said(d) }
+        }
+        err.fileHandleForReading.readabilityHandler = { h in
+            let d = h.availableData
+            if d.isEmpty { h.readabilityHandler = nil; return }
+            if let s = String(data: d, encoding: .utf8) {
+                logger.warn("discord bot helper: \(s.replacingOccurrences(of: sec, with: "***").trimmingCharacters(in: .whitespacesAndNewlines).prefix(300))")
+            }
+        }
+        p.terminationHandler = { [weak self] q in DispatchQueue.main.async { self?.ended(q) } }
+        do {
+            try p.run()
+        } catch {
+            status = "could not start the helper"
+            logger.error("discord bot: could not start the helper: \(error.localizedDescription)")
+            onchange?()
+            return
+        }
+        proc = p
+        logger.info("discord bot helper started")
+    }
+
+    // the helper prints "furrbot: <status>" lines, those become the status in the tab
+    func said(_ d: Data) {
+        for line in (String(data: d, encoding: .utf8) ?? "").split(separator: "\n") where line.hasPrefix("furrbot: ") {
+            status = String(line.dropFirst(9)).replacingOccurrences(of: secret, with: "***")
+            logger.info("discord bot: \(status)")
+        }
+        onchange?()
+    }
+
+    func ended(_ q: Process) {
+        guard q === proc else { return }
+        proc = nil
+        sig = ""
+        logger.warn("discord bot helper exited (status \(q.terminationStatus))")
+        if ["starting", "connecting", "connected"].contains(status) { status = "stopped, see the log" }
+        onchange?()
+    }
+}
+
+// Receives the small, authenticated media snapshot sent by the optional browser extension.
+// It listens only on loopback; regular web pages do not know the random key stored in config.
+final class browserwatch {
+    var listener: NWListener?
+    var state: [String: Any]?
+    var stamp = Date.distantPast
+    var status = "off"
+    var key = ""
+    var onchange: (() -> Void)?
+
+    func start(key: String) {
+        if listener != nil && self.key == key { return }
+        stop()
+        self.key = key
+        let params = NWParameters.tcp
+        params.requiredLocalEndpoint = .hostPort(host: .ipv4(.loopback), port: 49193)
+        do {
+            let l = try NWListener(using: params)
+            listener = l
+            l.newConnectionHandler = { [weak self] in self?.serve($0) }
+            l.stateUpdateHandler = { [weak self, weak l] s in
+                guard let self = self, l === self.listener else { return }
+                switch s {
+                case .ready: self.status = "ready, waiting for browser media"
+                case .failed(let e): self.status = "unavailable: \(e.localizedDescription)"
+                default: return
+                }
+                self.onchange?()
+            }
+            l.start(queue: .main)
+        } catch {
+            status = "could not open local connection"
+            onchange?()
+        }
+    }
+
+    func stop() {
+        listener?.cancel()
+        listener = nil
+        state = nil
+        status = "off"
+    }
+
+    func current() -> [String: Any]? {
+        guard Date().timeIntervalSince(stamp) < 12 else { return nil }
+        return state
+    }
+
+    func serve(_ c: NWConnection) {
+        c.start(queue: .main)
+        receive(c, Data())
+    }
+
+    // HTTP headers and bodies are allowed to arrive in separate TCP packets.
+    func receive(_ c: NWConnection, _ collected: Data) {
+        c.receive(minimumIncompleteLength: 1, maximumLength: 65_536 - collected.count) { [weak self] data, _, complete, _ in
+            guard let self = self else { c.cancel(); return }
+            var all = collected
+            if let data = data { all.append(data) }
+            guard all.count <= 65_536 else { self.respond(c, "413 Payload Too Large"); return }
+            if let marker = all.range(of: Data("\r\n\r\n".utf8)) {
+                let headData = all[..<marker.lowerBound]
+                let body = all[marker.upperBound...]
+                let head = String(data: headData, encoding: .utf8) ?? ""
+                let lines = head.components(separatedBy: "\r\n")
+                let origin = lines.first(where: { $0.lowercased().hasPrefix("origin:") })?
+                    .split(separator: ":", maxSplits: 1).last?.trimmingCharacters(in: .whitespaces) ?? ""
+                if lines.first?.hasPrefix("GET /pair ") == true,
+                   origin.hasPrefix("chrome-extension://") || origin.hasPrefix("moz-extension://") {
+                    let data = (try? JSONSerialization.data(withJSONObject: ["key": self.key])) ?? Data("{}".utf8)
+                    self.respond(c, "200 OK", data, origin)
+                    return
+                }
+                let length = lines.first(where: { $0.lowercased().hasPrefix("content-length:") })
+                    .flatMap { Int($0.split(separator: ":", maxSplits: 1).last?.trimmingCharacters(in: .whitespaces) ?? "") } ?? 0
+                if body.count < length && !complete { self.receive(c, all); return }
+                let authed = lines.contains { $0.lowercased() == "x-furrpc-browser-key: " + self.key.lowercased() }
+                if authed, lines.first?.hasPrefix("POST /media ") == true,
+                   let o = try? JSONSerialization.jsonObject(with: Data(body.prefix(length))) as? [String: Any] {
+                    if o["playing"] as? Bool == true {
+                        self.state = o
+                        self.stamp = Date()
+                        self.status = "tracking \(o["service"] as? String ?? "browser media")"
+                    } else {
+                        self.state = nil
+                        self.status = "ready, waiting for browser media"
+                    }
+                    self.onchange?()
+                    self.respond(c, "204 No Content")
+                    return
+                }
+                self.respond(c, "403 Forbidden")
+            } else if complete {
+                self.respond(c, "400 Bad Request")
+            } else {
+                self.receive(c, all)
+            }
+        }
+    }
+
+    func respond(_ c: NWConnection, _ code: String, _ body: Data = Data(), _ origin: String = "") {
+        var response = "HTTP/1.1 \(code)\r\nContent-Length: \(body.count)\r\nConnection: close\r\n"
+        if !origin.isEmpty { response += "Content-Type: application/json\r\nAccess-Control-Allow-Origin: \(origin)\r\n" }
+        response += "\r\n"
+        c.send(content: Data(response.utf8) + body, completion: .contentProcessed { _ in c.cancel() })
+    }
 }
 
 // lowercase words only, so "In Perpetuity" and "in perpetuity!" match
@@ -680,6 +1081,20 @@ final class furrpc: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTableView
     var tvimagefield: NSTextField!
     var tvtexts: [NSTextField] = []
     var tvstatus: NSTextField?
+    let bot = botwatch()
+    let stats = tracker()
+    var shown: [String: String]?
+    var botcheck: NSButton!
+    var bottoken: NSSecureTextField!
+    var botid: NSTextField!
+    var botstatus: NSTextField?
+    var botbutton: NSButton!
+    var botinvite: NSButton!
+    var botremove: NSButton!
+    var botinstalling = false
+    let browser = browserwatch()
+    var browsercheck: NSButton!
+    var browserstatus: NSTextField?
 
     func applicationDidFinishLaunching(_ n: Notification) {
         logger.info("furrpc started, \(hwline)")
@@ -694,12 +1109,18 @@ final class furrpc: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTableView
         }
         DistributedNotificationCenter.default().addObserver(forName: .init("furrpc.reload"), object: nil, queue: .main) { [weak self] _ in self?.reload() }
         tv.onchange = { [weak self] in self?.refresh() }
+        bot.answer = { [weak self] path in self?.botanswer(path) }
+        bot.onchange = { [weak self] in self?.updatebotstatus() }
+        browser.onchange = { [weak self] in self?.browserchanged() }
         reload()
         if apps.isEmpty { showwindow() }
     }
 
     func applicationWillTerminate(_ n: Notification) {
         tv.stop()
+        bot.stop()
+        browser.stop()
+        stats.close()
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
@@ -719,6 +1140,8 @@ final class furrpc: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTableView
             NSStatusBar.system.removeStatusItem(i)
             item = nil
         }
+        botsync()
+        browsersync()
         refresh()
     }
 
@@ -829,6 +1252,38 @@ final class furrpc: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTableView
         timer = t
     }
 
+    func browseractivity() -> [String: Any]? {
+        guard flagoff("browser_media"), let s = browser.current() else { return nil }
+        let service = cased(s["service"] as? String ?? "Browser Media")
+        let title = cased(s["title"] as? String ?? service)
+        let kind = s["kind"] as? String ?? "video"
+        var act: [String: Any] = [
+            "name": service,
+            "type": kind == "audio" ? 2 : 3,
+            "details": String(title.prefix(128)),
+            "assets": ["large_image": fallbackimage, "large_text": service],
+        ]
+        let position = s["position"] as? Double ?? 0
+        let duration = s["duration"] as? Double ?? 0
+        if duration > 0 {
+            let start = Int(Date().timeIntervalSince1970 - position)
+            act["timestamps"] = ["start": start, "end": start + Int(duration)]
+        }
+        shown = ["name": "\(service) · \(title)", "image": fallbackimage]
+        stats.set("browser:" + service.lowercased(), service)
+        return act
+    }
+
+    func showbrowser(_ act: [String: Any]) {
+        if rpc.connected && rpc.cid != clientid { rpc.drop() }
+        rpc.connect(clientid)
+        rpc.set(act)
+        let t = Timer(timeInterval: 10, repeats: true) { [weak self] _ in self?.refresh() }
+        t.tolerance = 2
+        RunLoop.main.add(t, forMode: .common)
+        timer = t
+    }
+
     func refresh() {
         tvsync()
         updatetvstatus()
@@ -836,14 +1291,22 @@ final class furrpc: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTableView
         if NSWorkspace.shared.frontmostApplication?.processIdentifier == getpid() { return }
         timer?.invalidate()
         timer = nil
-        // a listed app in front always wins, otherwise what apple tv is playing is shown
+        // a listed app in front wins, then browser media, then apple tv
         let front = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
         let frontlisted = front.map { apps.contains($0) && !disabled.contains($0) } ?? false
+        if !frontlisted, let act = browseractivity() {
+            showbrowser(act)
+            return
+        }
         if !frontlisted, let act = tvactivity() {
+            shown = nil
+            stats.set("media:apple-tv", flag("lowercase") ? "apple tv" : "Apple TV")
             showtv(act)
             return
         }
         guard let a = target(), let id = a.bundleIdentifier else {
+            shown = nil
+            stats.set(nil, "")
             rpc.set(nil)
             return
         }
@@ -859,6 +1322,8 @@ final class furrpc: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTableView
         rpc.connect(cid)
         let name = pick(mine?["name"]) ?? g?["name"] ?? a.localizedName.map(cased) ?? id
         let image = pick(mine?["image"]) ?? g?["image"] ?? fallbackimage
+        shown = ["name": name, "image": image]
+        stats.set(id, name)
         var act: [String: Any] = [
             "name": name,
             "type": 0,
@@ -899,7 +1364,8 @@ final class furrpc: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTableView
         let m = NSMenu()
         m.addItem(withTitle: "open furrpc", action: #selector(showwindow), keyEquivalent: "").target = self
         m.addItem(.separator())
-        m.addItem(withTitle: "quit furrpc", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        let quit = m.addItem(withTitle: "quit furrpc", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        quit.keyEquivalentModifierMask = [.command, .shift]
         i.menu = m
         item = i
     }
@@ -909,7 +1375,10 @@ final class furrpc: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTableView
         let bar = NSMenu()
         let appitem = NSMenuItem()
         let appmenu = NSMenu()
-        appmenu.addItem(withTitle: "quit furrpc", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        let close = appmenu.addItem(withTitle: "close settings", action: #selector(closewindow), keyEquivalent: "q")
+        close.target = self
+        let quit = appmenu.addItem(withTitle: "quit furrpc", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        quit.keyEquivalentModifierMask = [.command, .shift]
         appitem.submenu = appmenu
         let edititem = NSMenuItem()
         let edit = NSMenu(title: "edit")
@@ -926,7 +1395,7 @@ final class furrpc: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTableView
     func buildwindow() {
         let W: CGFloat = 640, H: CGFloat = 620
         let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: W, height: H), styleMask: [.titled, .closable], backing: .buffered, defer: false)
-        w.title = "furrpc"
+        w.title = "furrpc settings"
         w.isReleasedWhenClosed = false
         w.center()
         let v = w.contentView!
@@ -976,7 +1445,7 @@ final class furrpc: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTableView
         }
 
         // tab 1: setup guide
-        let guide = tab("setup")
+        let guide = tab("getting started")
         let gs = NSTextView.scrollableTextView()
         let gt = gs.documentView as! NSTextView
         gt.isEditable = false
@@ -1024,7 +1493,7 @@ final class furrpc: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTableView
         place(NSButton(title: "add by bundle id…", target: self, action: #selector(addmanual)), 8, 8, 150, 26, in: appsview)
 
         // tab 3: settings
-        let sv = tab("settings")
+        let sv = tab("general")
         let idlabel = NSTextField(labelWithString: "default client id (discord application id)")
         idlabel.font = .boldSystemFont(ofSize: 12)
         place(idlabel, 12, ch - 32, cw - 24, 17, in: sv)
@@ -1090,14 +1559,326 @@ final class furrpc: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTableView
         credit.isSelectable = true
         place(credit, 12, 8, cw - 24, 16, in: tvv)
 
+        // tab 5: discord bot
+        let bv = tab("discord bot")
+        func bnote(_ text: String, _ y: CGFloat) {
+            let l = NSTextField(labelWithString: text)
+            l.font = .systemFont(ofSize: 11)
+            l.textColor = .secondaryLabelColor
+            place(l, 12, y, cw - 24, 16, in: bv)
+        }
+        func bhead(_ text: String, _ y: CGFloat) {
+            let l = NSTextField(labelWithString: text)
+            l.font = .boldSystemFont(ofSize: 12)
+            place(l, 12, y, cw - 24, 17, in: bv)
+        }
+        bnote("optional · adds /furrpc now, /furrpc tv and /furrpc stats to your discord server.", ch - 28)
+        botcheck = NSButton(checkboxWithTitle: "turn on discord bot", target: nil, action: nil)
+        botcheck.toolTip = "the helper runs only while furrpc is open and can only read the three displayed results"
+        place(botcheck, 12, ch - 56, cw - 24, 20, in: bv)
+        bhead("1. bot token", ch - 92)
+        bottoken = NSSecureTextField(frame: .zero)
+        place(bottoken, 12, ch - 118, cw - 132, 22, in: bv)
+        botremove = NSButton(title: "forget token", target: self, action: #selector(removebottoken))
+        place(botremove, cw - 112, ch - 120, 100, 26, in: bv)
+        bnote("stored securely in macos keychain. blank keeps the saved token.", ch - 138)
+        bhead("2. application id", ch - 168)
+        botid = NSTextField(string: "")
+        botid.placeholderString = "digits shown on the discord application's general information page"
+        place(botid, 12, ch - 194, cw - 24, 22, in: bv)
+        bnote("create a bot and copy both values at discord.com/developers/applications.", ch - 214)
+        let portal = NSButton(title: "open discord developer portal", target: self, action: #selector(openbotportal))
+        place(portal, 12, ch - 254, 190, 26, in: bv)
+        botbutton = NSButton(title: "set up bot…", target: self, action: #selector(botsetup))
+        botbutton.bezelStyle = .rounded
+        place(botbutton, 210, ch - 254, 120, 26, in: bv)
+        botinvite = NSButton(title: "add to my discord…", target: self, action: #selector(invitebot))
+        place(botinvite, 338, ch - 254, 130, 26, in: bv)
+        bnote("set up saves these details, prepares a private helper, and turns the bot on.", ch - 274)
+        let bs = NSTextField(labelWithString: "")
+        bs.lineBreakMode = .byTruncatingTail
+        bs.font = .boldSystemFont(ofSize: 12)
+        place(bs, 12, ch - 306, cw - 24, 17, in: bv)
+        botstatus = bs
+        bnote("privacy: requests stay on this mac until the bot posts a command result to discord.", ch - 338)
+        bnote("the app is installed to your account, not added as a member of a server.", ch - 358)
+
+        // tab 6: browser media
+        let web = tab("browser media")
+        let webhead = NSTextField(labelWithString: "show media playing in your web browser as discord activity")
+        webhead.font = .boldSystemFont(ofSize: 13)
+        place(webhead, 12, ch - 32, cw - 24, 18, in: web)
+        let webnote = NSTextField(wrappingLabelWithString: "works with youtube, netflix, soundcloud, twitch, spotify and most sites that use standard html video or audio. listed apps still take priority.")
+        webnote.textColor = .secondaryLabelColor
+        webnote.font = .systemFont(ofSize: 11)
+        place(webnote, 12, ch - 76, cw - 24, 36, in: web)
+        browsercheck = NSButton(checkboxWithTitle: "turn on browser media tracking", target: nil, action: nil)
+        place(browsercheck, 12, ch - 112, cw - 24, 20, in: web)
+        let webinstall = NSButton(title: "install browser extension…", target: self, action: #selector(installbrowserextension))
+        place(webinstall, 12, ch - 154, 190, 28, in: web)
+        let webprivacy = NSTextField(wrappingLabelWithString: "the extension sends only the playing service, page title and playback timing to furrpc through 127.0.0.1 on this mac. browsers require you to confirm extension installation.")
+        webprivacy.textColor = .secondaryLabelColor
+        webprivacy.font = .systemFont(ofSize: 11)
+        place(webprivacy, 12, ch - 210, cw - 24, 42, in: web)
+        let webstate = NSTextField(labelWithString: "")
+        webstate.font = .boldSystemFont(ofSize: 12)
+        webstate.lineBreakMode = .byTruncatingTail
+        place(webstate, 12, ch - 242, cw - 24, 18, in: web)
+        browserstatus = webstate
+        let webstats = NSTextField(wrappingLabelWithString: "play time is included in /furrpc stats together with apps and apple tv. stats are collected whenever tracking is active, even when the discord user app is off.")
+        webstats.textColor = .secondaryLabelColor
+        webstats.font = .systemFont(ofSize: 11)
+        place(webstats, 12, ch - 294, cw - 24, 38, in: web)
+
         // bottom bar
         status = NSTextField(labelWithString: "")
         status.textColor = .secondaryLabelColor
         place(status, 20, 24, 400, 17, in: v)
-        let save = NSButton(title: "save", target: self, action: #selector(savewin))
+        let save = NSButton(title: "save changes", target: self, action: #selector(savewin))
         save.keyEquivalent = "\r"
         place(save, W - 20 - 100, 16, 100, 30, in: v)
         win = w
+    }
+
+    // discord bot
+
+    // what the helper may ask for. all of it is read only, and only these three paths exist
+    func botanswer(_ path: String) -> [String: Any]? {
+        switch path {
+        case "/now":
+            guard let s = shown else { return ["app": NSNull()] }
+            let img = s["image"] ?? ""
+            return ["app": s["name"] ?? "", "image": img.hasPrefix("http") ? img : fallbackimage]
+        case "/tv":
+            guard tvon else { return ["playing": false, "note": "apple tv is turned off in furrpc"] }
+            guard let s = tv.state else { return ["playing": false, "note": "nothing is playing in the apple tv app"] }
+            var info: tvinfo?
+            if flag("appletv_tvmaze") && !s.show.isEmpty { info = maze.lookup(show: s.show, episode: s.title) {} }
+            var o: [String: Any] = ["playing": true, "show": s.show.isEmpty ? s.title : s.show, "title": s.show.isEmpty ? "" : s.title, "paused": s.rate <= 0]
+            if let se = info?.season, let n = info?.number {
+                o["season"] = se
+                o["number"] = n
+            }
+            if let img = info?.episodeimage ?? info?.showimage { o["image"] = img }
+            return o
+        case "/stats":
+            return stats.snapshot()
+        default:
+            return nil
+        }
+    }
+
+    // starts or stops the helper to match the saved settings. runs on launch and after every reload
+    func botsync() {
+        defer { updatebotstatus() }
+        guard boton else { bot.stop(); return }
+        let token = tokenstore.get() ?? ""
+        let appid = cfg["bot_client_id"] as? String ?? ""
+        if token.isEmpty || appid.isEmpty {
+            bot.stop()
+            bot.status = "add a bot token and application id"
+        } else if !botready() {
+            bot.stop()
+            bot.status = "discord.py is not installed, press setup"
+        } else {
+            bot.start(token: token, appid: appid)
+        }
+    }
+
+    func updatebotstatus() {
+        guard let l = botstatus else { return }
+        l.stringValue = "status: " + (botinstalling ? "installing discord.py, this takes a minute" : (boton ? bot.status : "off"))
+        l.textColor = bot.status == "connected" && boton ? .systemGreen : .labelColor
+        botinvite?.isEnabled = !(botid?.stringValue.trimmingCharacters(in: .whitespaces).isEmpty ?? true)
+        botremove?.isEnabled = tokenstore.has()
+    }
+
+    @objc func closewindow() { win?.orderOut(nil) }
+
+    func browsersync() {
+        if flagoff("browser_media") {
+            var key = cfg["browser_key"] as? String ?? ""
+            if key.isEmpty {
+                key = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
+                cfg["browser_key"] = key
+                savecfg()
+            }
+            browser.start(key: key)
+        } else {
+            browser.stop()
+        }
+        updatebrowserstatus()
+    }
+
+    func browserchanged() {
+        updatebrowserstatus()
+        refresh()
+    }
+
+    func updatebrowserstatus() {
+        browserstatus?.stringValue = "status: " + (flagoff("browser_media") ? browser.status : "off")
+    }
+
+    @objc func installbrowserextension() {
+        guard let source = Bundle.main.resourceURL?.appendingPathComponent("browser-extension"),
+              FileManager.default.fileExists(atPath: source.path) else {
+            alert("the browser extension is missing from this app")
+            return
+        }
+        let testURL = URL(string: "https://example.com")!
+        guard let appURL = NSWorkspace.shared.urlForApplication(toOpen: testURL) else {
+            alert("macos could not find your default browser")
+            return
+        }
+        let bundle = Bundle(url: appURL)?.bundleIdentifier ?? ""
+        let browserName = FileManager.default.displayName(atPath: appURL.path)
+        if bundle == "com.apple.Safari" {
+            let a = NSAlert()
+            a.messageText = "safari needs a signed safari extension"
+            a.informativeText = "apple does not allow an app to install an unpacked safari extension. set firefox or a chromium browser as the default, then press this button again."
+            a.addButton(withTitle: "ok")
+            NSApp.activate(ignoringOtherApps: true)
+            a.runModal()
+            return
+        }
+        let firefox = bundle.lowercased().contains("firefox")
+        let supported = firefox || ["chrome", "chromium", "edge", "brave", "arc", "vivaldi", "opera"].contains { bundle.lowercased().contains($0) }
+        guard supported else {
+            alert("\(browserName) does not provide a compatible extension installation method. use firefox or a chromium-based browser.")
+            return
+        }
+        var key = cfg["browser_key"] as? String ?? ""
+        if key.isEmpty {
+            key = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
+            cfg["browser_key"] = key
+        }
+        cfg["browser_media"] = true
+        savecfg()
+        let folder = supportdir.appendingPathComponent("browser-extension")
+        do {
+            try? FileManager.default.removeItem(at: folder)
+            try FileManager.default.copyItem(at: source, to: folder)
+            let chosen = folder.appendingPathComponent(firefox ? "manifest-firefox.json" : "manifest-chromium.json")
+            try FileManager.default.copyItem(at: chosen, to: folder.appendingPathComponent("manifest.json"))
+        } catch {
+            alert("could not prepare the extension: \(error.localizedDescription)")
+            return
+        }
+        browsercheck.state = .on
+        browsersync()
+        let page: String
+        if firefox { page = "about:debugging#/runtime/this-firefox" }
+        else if bundle.lowercased().contains("edge") { page = "edge://extensions" }
+        else if bundle.lowercased().contains("brave") { page = "brave://extensions" }
+        else if bundle.lowercased().contains("arc") { page = "arc://extensions" }
+        else if bundle.lowercased().contains("vivaldi") { page = "vivaldi://extensions" }
+        else { page = "chrome://extensions" }
+        DispatchQueue.global().async { _ = runtool("/usr/bin/open", ["-b", bundle, page]) }
+        NSWorkspace.shared.selectFile(folder.appendingPathComponent("manifest.json").path, inFileViewerRootedAtPath: folder.path)
+        let a = NSAlert()
+        a.messageText = "finish installing in \(browserName)"
+        a.informativeText = firefox
+            ? "click Load Temporary Add-on, then choose manifest.json in the folder shown in Finder. Firefox removes temporary add-ons when it closes."
+            : "turn on Developer mode, click Load unpacked, then choose the browser-extension folder shown in Finder."
+        a.addButton(withTitle: "ok")
+        NSApp.activate(ignoringOtherApps: true)
+        a.runModal()
+    }
+
+    @objc func openbotportal() {
+        if let u = URL(string: "https://discord.com/developers/applications") { NSWorkspace.shared.open(u) }
+    }
+
+    @objc func invitebot() {
+        let id = botid.stringValue.trimmingCharacters(in: .whitespaces)
+        guard checkclient(id) == nil, !id.isEmpty else {
+            alert("paste the bot's application id first")
+            return
+        }
+        let raw = "https://discord.com/oauth2/authorize?client_id=\(id)&scope=applications.commands&integration_type=1"
+        if let u = URL(string: raw) { NSWorkspace.shared.open(u) }
+    }
+
+    @objc func removebottoken() {
+        let a = NSAlert()
+        a.messageText = "forget the saved bot token?"
+        a.informativeText = "the bot will stop until you paste and save a token again."
+        a.addButton(withTitle: "forget token")
+        a.addButton(withTitle: "cancel")
+        NSApp.activate(ignoringOtherApps: true)
+        guard a.runModal() == .alertFirstButtonReturn else { return }
+        if tokenstore.remove() {
+            bottoken.stringValue = ""
+            bottoken.placeholderString = "paste your bot token"
+            cfg["discord_bot"] = false
+            savecfg()
+            bot.stop()
+            updatebotstatus()
+        } else {
+            alert("macos could not remove the token from keychain")
+        }
+    }
+
+    @objc func botsetup() {
+        let id = botid.stringValue.trimmingCharacters(in: .whitespaces)
+        let entered = bottoken.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let message = checkclient(id) ?? (entered.contains(" ") ? "a bot token has no spaces" : nil) {
+            alert(message)
+            return
+        }
+        guard !id.isEmpty else { alert("paste the bot's application id first"); return }
+        guard !entered.isEmpty || tokenstore.has() else { alert("paste the bot token first"); return }
+        if !entered.isEmpty && !tokenstore.set(entered) { alert("macos could not save the token to keychain"); return }
+        cfg["bot_client_id"] = id
+        cfg["discord_bot"] = true
+        savecfg()
+        botid.stringValue = id
+        bottoken.stringValue = ""
+        bottoken.placeholderString = "saved in the keychain"
+        botcheck.state = .on
+        if botready() {
+            botsync()
+            alert("the app is set up and connecting. press add to my discord to install it to your account.")
+            return
+        }
+        guard let py = findpython() else {
+            let a = NSAlert()
+            a.messageText = "python 3 was not found"
+            a.informativeText = "the discord bot needs python 3.8 or newer. install it from python.org (or with homebrew: brew install python), then press setup again. furrpc does not install python itself."
+            a.addButton(withTitle: "open python.org")
+            a.addButton(withTitle: "cancel")
+            NSApp.activate(ignoringOtherApps: true)
+            if a.runModal() == .alertFirstButtonReturn, let u = URL(string: "https://www.python.org/downloads/macos/") { NSWorkspace.shared.open(u) }
+            return
+        }
+        let a = NSAlert()
+        a.messageText = "install discord.py?"
+        a.informativeText = "furrpc will make a private python environment in its support folder and download discord.py into it from pypi. this is the only download, and it only happens now."
+        a.addButton(withTitle: "install")
+        a.addButton(withTitle: "cancel")
+        NSApp.activate(ignoringOtherApps: true)
+        guard a.runModal() == .alertFirstButtonReturn else { return }
+        botinstalling = true
+        botbutton.isEnabled = false
+        updatebotstatus()
+        logger.info("discord bot setup: installing discord.py with \(py)")
+        DispatchQueue.global().async {
+            var r = runtool(py, ["-m", "venv", venvdir.path])
+            if r.0 == 0 { r = runtool(venvpython, ["-m", "pip", "install", "--disable-pip-version-check", "--quiet", "--upgrade", "discord.py>=2.4,<3"]) }
+            DispatchQueue.main.async { [self] in
+                botinstalling = false
+                botbutton.isEnabled = true
+                if r.0 == 0 && botready() {
+                    logger.info("discord bot setup: done")
+                    botsync()
+                    alert("discord.py is installed")
+                } else {
+                    logger.error("discord bot setup failed: \(r.1.trimmingCharacters(in: .whitespacesAndNewlines).suffix(300))")
+                    updatebotstatus()
+                    alert("setup failed, see the log (furrpc log)")
+                }
+            }
+        }
     }
 
     // tvmaze data is cc by-sa 4.0, so the tab links to the source and the license
@@ -1374,6 +2155,13 @@ final class furrpc: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTableView
         tvimagefield.stringValue = cfg["appletv_image"] as? String ?? ""
         for (n, k) in tvtextkeys.enumerated() { tvtexts[n].stringValue = cfg[k] as? String ?? "" }
         updatetvstatus()
+        botcheck.state = boton ? .on : .off
+        botid.stringValue = cfg["bot_client_id"] as? String ?? ""
+        bottoken.stringValue = ""
+        bottoken.placeholderString = tokenstore.has() ? "saved in the keychain" : "paste your bot token"
+        updatebotstatus()
+        browsercheck.state = flagoff("browser_media") ? .on : .off
+        updatebrowserstatus()
         let off = disabled
         rows = apps.map { id in
             let o = overrides[id] ?? [:]
@@ -1408,6 +2196,20 @@ final class furrpc: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTableView
             alert(m)
             return
         }
+        let bid = botid.stringValue.trimmingCharacters(in: .whitespaces)
+        let tok = bottoken.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let m = checkclient(bid) ?? (tok.contains(" ") ? "a bot token has no spaces" : nil) {
+            tabs.selectTabViewItem(at: 4)
+            alert(m)
+            return
+        }
+        if !tok.isEmpty && !tokenstore.set(tok) {
+            tabs.selectTabViewItem(at: 4)
+            alert("could not save the token to the keychain")
+            return
+        }
+        bottoken.stringValue = ""
+        bottoken.placeholderString = tokenstore.has() ? "saved in the keychain" : "paste your bot token"
         apps = rows.map { $0.id }
         disabled = rows.filter { !$0.enabled }.map { $0.id }
         var o: [String: [String: String]] = [:]
@@ -1428,6 +2230,9 @@ final class furrpc: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTableView
         cfg["appletv_tvmaze"] = tvchecks[1].state == .on
         cfg["appletv_progress"] = tvchecks[2].state == .on
         cfg["appletv_paused"] = tvchecks[3].state == .on
+        cfg["discord_bot"] = botcheck.state == .on
+        cfg["browser_media"] = browsercheck.state == .on
+        if bid.isEmpty { cfg.removeValue(forKey: "bot_client_id") } else { cfg["bot_client_id"] = bid }
         if tid.isEmpty { cfg.removeValue(forKey: "appletv_client_id") } else { cfg["appletv_client_id"] = tid }
         if timg.isEmpty { cfg.removeValue(forKey: "appletv_image") } else { cfg["appletv_image"] = timg }
         for (n, k) in tvtextkeys.enumerated() {
@@ -1473,6 +2278,7 @@ func runcli(_ a: [String]) {
       set id <application id>   use another discord application
       set background on|off     show even when the app is not in front
       set lowercase on|off      lowercase text in the presence (off keeps normal capitalization)
+      set browser on|off        show media playing in the browser extension
       set appletv on|off        show what the apple tv app is playing
       set tvmaze on|off         look up season, episode number and artwork on tvmaze
       set tvprogress on|off     show the progress bar
@@ -1517,6 +2323,7 @@ func runcli(_ a: [String]) {
         case "login": setlogin(val == "on")
         case "background": cfg["background"] = val == "on"
         case "lowercase": cfg["lowercase"] = val == "on"
+        case "browser": cfg["browser_media"] = val == "on"
         case "appletv": cfg["appletv"] = val == "on"
         case "tvmaze": cfg["appletv_tvmaze"] = val == "on"
         case "tvprogress": cfg["appletv_progress"] = val == "on"
@@ -1574,6 +2381,7 @@ func runcli(_ a: [String]) {
         print("login: \(onoff(loginon))")
         print("background: \(onoff(flagoff("background")))")
         print("lowercase: \(onoff(flag("lowercase")))")
+        print("browser: \(onoff(flagoff("browser_media")))")
         print("disabled: \(disabled.count)")
         print("customized: \(overrides.count)")
         print("id: \(clientid)")

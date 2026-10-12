@@ -21,7 +21,7 @@ it shows:
 
 it can also show what you are watching in the apple tv app, as a discord watching presence with the show, season and episode, and a live progress bar. see [apple tv](#apple-tv).
 
-**jump to:** [install](#install) · [first launch](#first-launch-macos-blocks-the-app) · [setup](#setup) · [use](#use) · [apple tv](#apple-tv) · [updates](#updates) · [configure](#configure) · [games.json](#gamesjson) · [command line](#command-line) · [logging](#logging) · [uninstall](#uninstall) · [license](#license)
+**jump to:** [install](#install) · [first launch](#first-launch-macos-blocks-the-app) · [setup](#setup) · [use](#use) · [apple tv](#apple-tv) · [discord bot](#discord-bot) · [browser media](#browser-media) · [updates](#updates) · [configure](#configure) · [games.json](#gamesjson) · [command line](#command-line) · [logging](#logging) · [uninstall](#uninstall) · [license](#license)
 
 ---
 
@@ -115,6 +115,8 @@ the time played is how long the game itself has been open, not how long furrpc h
 
 furrpc starts by itself when you log in. after that it lives in the menu bar as `:3`. click it and choose **open furrpc** to change things. you can turn the menu bar item and start at login off in the settings tab.
 
+`command-q` closes the settings window but leaves furrpc tracking in the menu bar. use `command-shift-q` or **quit furrpc** in the `:3` menu to stop it completely.
+
 ---
 
 ## apple tv
@@ -179,6 +181,43 @@ macos only lets apple-signed processes read that information, and furrpc is not 
 with **enable tvmaze lookups** on, furrpc sends the show name to tvmaze once per show to find it, then downloads that show's episode list once, matches the episode title and keeps the result in `~/Library/Application Support/furrpc/appletv-cache.json`. the same episode never asks again. if tvmaze is off, unreachable, or the show or episode does not match, the presence still works with the macos data. only an exact show name match is used, so a wrong show never gets shown.
 
 episode data and artwork come from [tvmaze.com](https://www.tvmaze.com) and are licensed [cc by-sa 4.0](https://creativecommons.org/licenses/by-sa/4.0/).
+
+---
+
+## discord bot
+
+the optional user-installed app lets you ask what furrpc sees from your discord account:
+
+* `/furrpc now` shows the app or game currently displayed
+* `/furrpc tv` shows the current apple tv title and episode
+* `/furrpc stats` shows local playtime and session counts for everything furrpc tracks
+
+open the **discord bot** tab and use the buttons in order:
+
+1. press **open discord developer portal**, create an application, add a bot on its **bot** page, and enable **user install** on the **installation** page
+2. copy the bot token into furrpc, then copy the application id from **general information**
+3. press **set up bot**. furrpc securely saves the token in macos keychain, turns the bot on, and prepares its private helper
+4. press **add to my discord** and authorize it for your account. it uses the `applications.commands` scope and is not added to a server
+
+the helper uses python 3.8 or newer and `discord.py`. setup creates a private environment in furrpc's support folder and installs `discord.py` there only after you confirm. it does not change the system python. the helper runs only while furrpc is open and talks back to furrpc through a randomly keyed localhost connection.
+
+the app is read only. it cannot change settings or run commands on the mac. the token is never stored in `config.json`, passed on the command line, or written to the log. its commands are registered for user installation and can appear in DMs, group DMs, and servers where discord allows external apps; results are visible in the place where you invoke them.
+
+---
+
+## browser media
+
+the optional browser extension detects playing html video or audio and sends the service, page title and playback timing to furrpc on `127.0.0.1`. it works with youtube, netflix, soundcloud, twitch, spotify and most other streaming sites that use standard browser media. listed apps take priority over browser media, which takes priority over apple tv.
+
+open the **browser media** tab and press **install browser extension**. furrpc detects the default browser, prepares the right extension, opens its extensions page and shows the folder to select. browser security requires you to confirm an unpacked extension yourself:
+
+* chromium browsers such as chrome, edge, brave, arc and vivaldi: enable **developer mode**, choose **load unpacked**, and select the shown `browser-extension` folder
+* firefox: choose **load temporary add-on** and select the shown `manifest.json`; firefox removes temporary add-ons when it closes
+* safari: apple only permits signed safari app extensions, so this local build cannot install one. use firefox or a chromium browser for browser-media tracking
+
+the extension does not send browsing history to furrpc. it reports only a currently playing tab and stops reporting when playback stops. app, apple tv and browser-media time all appear in `/furrpc stats`, whether or not the discord user app is enabled.
+
+the complete extension source is in `browser-extension`. every build also makes `build/extensions/furrpc-chromium-store.zip` for the chrome web store and `build/extensions/furrpc-firefox-amo.zip` for firefox add-ons. firefox discloses its required `websiteContent` permission because the playing page title is sent to the local furrpc app; it is never sent to a furrpc server.
 
 ---
 
@@ -342,6 +381,9 @@ this removes everything furrpc puts on your mac. paste the commands into termina
 | logs | `~/Library/Application Support/furrpc/furrpc.log` and `furrpc.log.old` |
 | your own `games.json` (only if you made it) | `~/Library/Application Support/furrpc/games.json` |
 | tvmaze cache (only if you used apple tv) | `~/Library/Application Support/furrpc/appletv-cache.json` |
+| bot helper and statistics (only if used) | `~/Library/Application Support/furrpc/bot-venv` and `stats.json` |
+| bot token (only if saved) | macos keychain item named `furrpc discord bot` |
+| prepared browser extension (only if installed) | `~/Library/Application Support/furrpc/browser-extension` |
 | start at login item | a login item in system settings |
 | macos leftovers (may exist) | `~/Library/Preferences/com.furrpc.app.plist`, `~/Library/Saved Application State/com.furrpc.app.savedState`, `~/Library/Caches/com.furrpc.app` |
 
