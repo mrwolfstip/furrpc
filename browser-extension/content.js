@@ -5,6 +5,7 @@
   const defaultHosts = globalThis.FURRPC_DEFAULT_HOSTS || [];
   let allowedHosts = [...defaultHosts];
   let showBrowsing = false;
+  const musicHosts = new Set(["music.youtube.com", "soundcloud.com", "open.spotify.com", "music.apple.com", "music.amazon.com", "tidal.com", "deezer.com", "pandora.com", "bandcamp.com", "mixcloud.com"]);
 
   chrome.storage.local.get(["enabledHosts", "showBrowsing"], settings => {
     if (Array.isArray(settings.enabledHosts)) allowedHosts = settings.enabledHosts;
@@ -55,8 +56,39 @@
     return "";
   };
 
+  const mediaMetadata = () => {
+    try { return navigator.mediaSession?.metadata || null; }
+    catch (_) { return null; }
+  };
+
+  const mediaTitle = (host, service) => {
+    if (musicHosts.has(host)) {
+      const metadataTitle = mediaMetadata()?.title?.trim();
+      if (metadataTitle && metadataTitle !== service) return metadataTitle.slice(0, 128);
+      const playerTitle = text([
+        "ytmusic-player-bar .title.ytmusic-player-bar",
+        "[data-testid='context-item-info-title']",
+        ".playbackSoundBadge__titleLink",
+        ".lcd__track-name", ".track-title", ".now-playing__title"
+      ]);
+      if (playerTitle) return playerTitle;
+    }
+    return cleanTitle(service);
+  };
+
   const creator = host => {
-    if (host === "youtube.com" || host === "music.youtube.com") {
+    if (musicHosts.has(host)) {
+      const metadataArtist = mediaMetadata()?.artist?.trim();
+      if (metadataArtist) return metadataArtist.slice(0, 128);
+      const playerArtist = text([
+        "ytmusic-player-bar .byline a:first-of-type",
+        "[data-testid='context-item-info-artist']",
+        ".playbackSoundBadge__lightLink",
+        ".lcd__sub-copy a:first-of-type", ".track-artist", ".now-playing__artist"
+      ]);
+      if (playerArtist) return playerArtist;
+    }
+    if (host === "youtube.com") {
       return text(["ytd-watch-metadata #owner #channel-name a", "#upload-info #channel-name a", "yt-formatted-string.ytd-channel-name a"]);
     }
     return text(["[itemprop='author'] [itemprop='name']", "[itemprop='author']", ".artist-name", ".creator-name", ".author-name", "[rel='author']"]);
@@ -71,9 +103,26 @@
   };
 
   const artwork = active => {
+    const host = location.hostname.replace(/^www\./, "");
+    if (musicHosts.has(host)) {
+      const covers = mediaMetadata()?.artwork || [];
+      for (const cover of [...covers].reverse()) {
+        const found = absoluteImage(cover?.src);
+        if (found) return found;
+      }
+      for (const selector of [
+        "ytmusic-player-bar #song-image img", "ytmusic-player-bar img.image",
+        "[data-testid='cover-art-image']", ".playbackSoundBadge__avatar img",
+        ".lcd__artwork img", ".now-playing img", ".player-artwork img"
+      ]) {
+        const image = document.querySelector(selector);
+        const found = absoluteImage(image?.currentSrc || image?.src);
+        if (found) return found;
+      }
+    }
     // YouTube's SPA metadata can be missing or stale after navigating between
     // videos. Its video ID gives us a stable, publicly fetchable thumbnail.
-    if (location.hostname.replace(/^www\./, "") === "youtube.com" || location.hostname === "music.youtube.com") {
+    if (host === "youtube.com" || host === "music.youtube.com") {
       const videoID = new URLSearchParams(location.search).get("v") || location.pathname.match(/^\/shorts\/([^/?]+)/)?.[1];
       if (/^[A-Za-z0-9_-]{11}$/.test(videoID || "")) return `https://i.ytimg.com/vi/${videoID}/hqdefault.jpg`;
     }
@@ -104,10 +153,10 @@
       playing: !!active,
       browsing,
       service,
-      title: cleanTitle(service),
+      title: mediaTitle(host, service),
       subtitle: creator(host),
       image: artwork(active),
-      kind: active?.tagName?.toLowerCase() === "audio" ? "audio" : "video",
+      kind: musicHosts.has(host) || active?.tagName?.toLowerCase() === "audio" ? "audio" : "video",
       position: active && Number.isFinite(active.currentTime) ? active.currentTime : 0,
       duration: active && Number.isFinite(active.duration) ? active.duration : 0
     };
