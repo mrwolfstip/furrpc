@@ -102,6 +102,23 @@
     } catch (_) { return ""; }
   };
 
+  const cssImage = selectors => {
+    for (const selector of selectors) {
+      const element = document.querySelector(selector);
+      if (!element) continue;
+      const match = getComputedStyle(element).backgroundImage.match(/^url\(["']?(.*?)["']?\)$/);
+      const found = absoluteImage(match?.[1]);
+      if (found) return found;
+    }
+    return "";
+  };
+
+  const clock = value => {
+    const parts = (value || "").trim().split(":").map(Number);
+    if (!parts.length || parts.some(part => !Number.isFinite(part))) return 0;
+    return parts.reduce((seconds, part) => seconds * 60 + part, 0);
+  };
+
   const artwork = active => {
     const host = location.hostname.replace(/^www\./, "");
     if (musicHosts.has(host)) {
@@ -117,6 +134,10 @@
       ]) {
         const image = document.querySelector(selector);
         const found = absoluteImage(image?.currentSrc || image?.src);
+        if (found) return found;
+      }
+      if (host === "soundcloud.com") {
+        const found = cssImage([".playbackSoundBadge__avatar .sc-artwork", ".playbackSoundBadge__avatar span", ".playbackSoundBadge__avatar"]);
         if (found) return found;
       }
     }
@@ -147,18 +168,26 @@
     const allowed = allowedHosts.some(item => host === item || host.endsWith("." + item));
     const media = [...document.querySelectorAll("video, audio")];
     const active = allowed ? media.find(m => !m.paused && !m.ended && m.readyState >= 2) : null;
+    const soundCloudButton = host === "soundcloud.com" ? document.querySelector(".playControls__play, .playControl") : null;
+    const soundCloudPlaying = allowed && !!soundCloudButton && (
+      soundCloudButton.classList.contains("playing") ||
+      /pause/i.test(soundCloudButton.getAttribute("aria-label") || soundCloudButton.getAttribute("title") || "")
+    );
+    const playing = !!active || soundCloudPlaying;
     const service = serviceName();
-    const browsing = allowed && showBrowsing && !active && document.visibilityState === "visible";
+    const browsing = allowed && showBrowsing && !playing && document.visibilityState === "visible";
+    const soundCloudPosition = soundCloudPlaying ? clock(text([".playbackTimeline__timePassed span:last-child", ".playbackTimeline__timePassed"])) : 0;
+    const soundCloudDuration = soundCloudPlaying ? clock(text([".playbackTimeline__duration span:last-child", ".playbackTimeline__duration"])) : 0;
     const data = {
-      playing: !!active,
+      playing,
       browsing,
       service,
       title: mediaTitle(host, service),
       subtitle: creator(host),
       image: artwork(active),
       kind: musicHosts.has(host) || active?.tagName?.toLowerCase() === "audio" ? "audio" : "video",
-      position: active && Number.isFinite(active.currentTime) ? active.currentTime : 0,
-      duration: active && Number.isFinite(active.duration) ? active.duration : 0
+      position: active && Number.isFinite(active.currentTime) ? active.currentTime : soundCloudPosition,
+      duration: active && Number.isFinite(active.duration) ? active.duration : soundCloudDuration
     };
     const signature = JSON.stringify(data);
     if (signature !== last) {
