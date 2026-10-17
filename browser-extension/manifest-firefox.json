@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "name": "furrpc browser media",
-  "version": "1.2.2",
+  "version": "1.2.3",
   "description": "Sends playing browser media to furrpc on this Mac.",
   "icons": {
     "48": "icons/icon-48.png",
@@ -13,7 +13,8 @@
   "content_scripts": [{
     "matches": ["http://*/*", "https://*/*"],
     "js": ["sources.js", "content.js"],
-    "run_at": "document_idle"
+    "run_at": "document_idle",
+    "all_frames": true
   }],
   "browser_specific_settings": {
     "gecko": {

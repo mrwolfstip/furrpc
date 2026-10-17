@@ -209,13 +209,13 @@ the app is read only. it cannot change settings or run commands on the mac. the 
 
 the optional browser extension detects playing html video or audio and sends the service, page title and playback timing to furrpc on `127.0.0.1`. it works with youtube, netflix, soundcloud, twitch, spotify and most other streaming sites that use standard browser media. listed apps take priority over browser media, which takes priority over apple tv.
 
-open the **browser media** tab and press **install browser extension**. furrpc detects the default browser, prepares the right extension, opens its extensions page and shows the folder to select. browser security requires you to confirm an unpacked extension yourself:
+open the **browser media** tab and press **install browser extension**. furrpc detects your default browser and does the right thing for it:
 
-* chromium browsers such as chrome, edge, brave, arc and vivaldi: enable **developer mode**, choose **load unpacked**, and select the shown `browser-extension` folder
-* firefox: choose **load temporary add-on** and select the shown `manifest.json`; firefox removes temporary add-ons when it closes
-* safari: apple only permits signed safari app extensions, so this local build cannot install one. use firefox or a chromium browser for browser-media tracking
+* firefox: opens the [furrpc browser helper](https://addons.mozilla.org/en-GB/firefox/addon/furrpc-browser-helper/) page on firefox add-ons. click **add to firefox**. this install is permanent and updates itself, and it pairs with furrpc automatically, so there is no folder to select
+* chromium browsers such as chrome, edge, brave, arc and vivaldi: there is no store listing, so the extension stays unpacked. furrpc prepares it, opens the extensions page and shows the folder to select. enable **developer mode**, choose **load unpacked**, and select the shown `browser-extension` folder
+* safari: apple only permits signed safari app extensions, so this local build cannot install one. firefox installs in one click, so use firefox or a chromium browser for browser-media tracking
 
-the extension sends the page title, creator or channel name when available, artwork and playback timing to furrpc. youtube uses the channel name as discord's second field. music services use the track title, artist and album cover exposed by their player. artwork is taken from the media player, page thumbnail, video poster or main visible image, and falls back to the furrpc logo when the site provides none. app, apple tv and browser-media time all appear in `/furrpc stats`, whether or not the discord user app is enabled.
+the extension sends the page title, creator or channel name when available, artwork and playback timing to furrpc. discord shows a progress bar when the player's position and length can be read: from the page's video or audio element, otherwise from the player's own scrubber or time labels. live streams show elapsed time only, and playback speed is taken into account. players embedded in other pages (such as vimeo embeds) are detected too. youtube uses the channel name as discord's second field. music services use the track title, artist and album cover exposed by their player. artwork is taken from the media player, page thumbnail, video poster or main visible image, and falls back to the furrpc logo when the site provides none. app, apple tv and browser-media time all appear in `/furrpc stats`, whether or not the discord user app is enabled.
 
 click the extension icon in the browser toolbar to configure sources. common video services (including youtube, netflix, disney+, prime video, max, hulu, paramount+, peacock, crunchyroll, twitch and vimeo) and music services (including youtube music, soundcloud, spotify, apple music, amazon music, tidal, deezer, pandora, bandcamp and mixcloud) are included and enabled by default. each one can be switched off, and any other website can be added by hostname. turn on **show while browsing** to show the active enabled site even when no audio or video is playing; this also lets image-focused and mixed-media pages show their current photo or video thumbnail. it is off by default.
 
@@ -401,7 +401,7 @@ this removes everything furrpc puts on your mac. paste the commands into termina
 | tvmaze cache (only if you used apple tv) | `~/Library/Application Support/furrpc/appletv-cache.json` |
 | bot helper and statistics (only if used) | `~/Library/Application Support/furrpc/bot-venv` and `stats.json` |
 | bot token (only if saved) | macos keychain item named `furrpc discord bot` |
-| prepared browser extension (only if installed) | `~/Library/Application Support/furrpc/browser-extension` |
+| prepared browser extension (chromium only, if installed) | `~/Library/Application Support/furrpc/browser-extension` |
 | start at login item | a login item in system settings |
 | macos leftovers (may exist) | `~/Library/Preferences/com.furrpc.app.plist`, `~/Library/Saved Application State/com.furrpc.app.savedState`, `~/Library/Caches/com.furrpc.app` |
 

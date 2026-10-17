@@ -6,6 +6,7 @@ import ServiceManagement
 let defaultid = "1554136413669433354"
 let fallbackimage = "https://files.catbox.moe/95gjsg.png"
 let githuburl = "https://github.com/mrwolfstip/furrpc"
+let firefoxaddonurl = "https://addons.mozilla.org/en-GB/firefox/addon/furrpc-browser-helper/"
 let supportdir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("furrpc")
 let configurl = supportdir.appendingPathComponent("config.json")
 let logurl = supportdir.appendingPathComponent("furrpc.log")
@@ -1089,6 +1090,8 @@ final class furrpc: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTableView
     let bot = botwatch()
     let stats = tracker()
     var shown: [String: String]?
+    // last browser timestamps, reused so the 1 s jitter of "now - position" does not resend the presence
+    var browserbar: (key: String, start: Double, end: Double?)?
     var botcheck: NSButton!
     var bottoken: NSSecureTextField!
     var botid: NSTextField!
@@ -1274,11 +1277,29 @@ final class furrpc: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTableView
         ]
         if !subtitle.isEmpty { act["state"] = String(subtitle.prefix(128)) }
         else if browsing { act["state"] = flag("lowercase") ? "browsing" : "Browsing" }
-        let position = s["position"] as? Double ?? 0
+        // live, rate and duration are optional so older extensions keep working
+        let position = max(0, s["position"] as? Double ?? 0)
         let duration = s["duration"] as? Double ?? 0
-        if !browsing && duration > 0 {
-            let start = Int(Date().timeIntervalSince1970 - position)
-            act["timestamps"] = ["start": start, "end": start + Int(duration)]
+        let live = s["live"] as? Bool == true
+        let rate = min(4, max(0.25, s["rate"] as? Double ?? 1))
+        if !browsing && position.isFinite && duration.isFinite && (live || duration > 0) {
+            let now = Date().timeIntervalSince1970
+            var start = now - position / rate
+            // live streams get an elapsed counter only, never a bar
+            var end: Double? = (live || position > duration + 1) ? nil : now + (duration - position) / rate
+            let key = service + "\u{1f}" + title
+            // same track and the same timeline within 3 s: keep the old values. a real
+            // seek, pause/resume or speed change moves them further and resets the cache.
+            if let old = browserbar, old.key == key, (old.end == nil) == (end == nil),
+               abs(old.start - start) <= 3, end == nil || abs((old.end ?? 0) - (end ?? 0)) <= 3 {
+                start = old.start
+                end = old.end
+            } else {
+                browserbar = (key, start, end)
+            }
+            var stamps: [String: Any] = ["start": Int(start)]
+            if let e = end { stamps["end"] = Int(e) }
+            act["timestamps"] = stamps
         }
         shown = ["name": "\(service) · \(title)", "image": image]
         stats.set("browser:" + service.lowercased(), service)
@@ -1731,11 +1752,6 @@ final class furrpc: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTableView
     }
 
     @objc func installbrowserextension() {
-        guard let source = Bundle.main.resourceURL?.appendingPathComponent("browser-extension"),
-              FileManager.default.fileExists(atPath: source.path) else {
-            alert("the browser extension is missing from this app")
-            return
-        }
         let testURL = URL(string: "https://example.com")!
         guard let appURL = NSWorkspace.shared.urlForApplication(toOpen: testURL) else {
             alert("macos could not find your default browser")
@@ -1746,7 +1762,7 @@ final class furrpc: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTableView
         if bundle == "com.apple.Safari" {
             let a = NSAlert()
             a.messageText = "safari needs a signed safari extension"
-            a.informativeText = "apple does not allow an app to install an unpacked safari extension. set firefox or a chromium browser as the default, then press this button again."
+            a.informativeText = "apple does not allow an app to install an unpacked safari extension. firefox installs in one click: set firefox as the default browser, then press this button again. a chromium browser also works."
             a.addButton(withTitle: "ok")
             NSApp.activate(ignoringOtherApps: true)
             a.runModal()
@@ -1765,21 +1781,36 @@ final class furrpc: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTableView
         }
         cfg["browser_media"] = true
         savecfg()
+        browsercheck.state = .on
+        browsersync()
+        if firefox {
+            // the store build pairs itself through GET /pair, so no folder is needed
+            DispatchQueue.global().async { _ = runtool("/usr/bin/open", ["-b", bundle, firefoxaddonurl]) }
+            let a = NSAlert()
+            a.messageText = "finish installing in \(browserName)"
+            a.informativeText = "click Add to Firefox on the page that just opened. this install is permanent and updates itself."
+            a.addButton(withTitle: "ok")
+            NSApp.activate(ignoringOtherApps: true)
+            a.runModal()
+            return
+        }
+        // chromium has no store listing, so it stays an unpacked extension
+        guard let source = Bundle.main.resourceURL?.appendingPathComponent("browser-extension"),
+              FileManager.default.fileExists(atPath: source.path) else {
+            alert("the browser extension is missing from this app")
+            return
+        }
         let folder = supportdir.appendingPathComponent("browser-extension")
         do {
             try? FileManager.default.removeItem(at: folder)
             try FileManager.default.copyItem(at: source, to: folder)
-            let chosen = folder.appendingPathComponent(firefox ? "manifest-firefox.json" : "manifest-chromium.json")
-            try FileManager.default.copyItem(at: chosen, to: folder.appendingPathComponent("manifest.json"))
+            try FileManager.default.copyItem(at: folder.appendingPathComponent("manifest-chromium.json"), to: folder.appendingPathComponent("manifest.json"))
         } catch {
             alert("could not prepare the extension: \(error.localizedDescription)")
             return
         }
-        browsercheck.state = .on
-        browsersync()
         let page: String
-        if firefox { page = "about:debugging#/runtime/this-firefox" }
-        else if bundle.lowercased().contains("edge") { page = "edge://extensions" }
+        if bundle.lowercased().contains("edge") { page = "edge://extensions" }
         else if bundle.lowercased().contains("brave") { page = "brave://extensions" }
         else if bundle.lowercased().contains("arc") { page = "arc://extensions" }
         else if bundle.lowercased().contains("vivaldi") { page = "vivaldi://extensions" }
@@ -1788,9 +1819,7 @@ final class furrpc: NSObject, NSApplicationDelegate, NSMenuDelegate, NSTableView
         NSWorkspace.shared.selectFile(folder.appendingPathComponent("manifest.json").path, inFileViewerRootedAtPath: folder.path)
         let a = NSAlert()
         a.messageText = "finish installing in \(browserName)"
-        a.informativeText = firefox
-            ? "click Load Temporary Add-on, then choose manifest.json in the folder shown in Finder. Firefox removes temporary add-ons when it closes."
-            : "turn on Developer mode, click Load unpacked, then choose the browser-extension folder shown in Finder."
+        a.informativeText = "turn on Developer mode, click Load unpacked, then choose the browser-extension folder shown in Finder."
         a.addButton(withTitle: "ok")
         NSApp.activate(ignoringOtherApps: true)
         a.runModal()

@@ -1,14 +1,19 @@
 furrpc browser media
 
-Chrome, Edge, Brave, Arc, Vivaldi and other Chromium browsers:
+Firefox:
+Install furrpc browser helper from Firefox Add-ons (this is the supported way):
+https://addons.mozilla.org/en-GB/firefox/addon/furrpc-browser-helper/
+It stays installed and updates itself. furrpc opens this page for you from
+the browser media tab.
+
+Chrome, Edge, Brave, Arc, Vivaldi and other Chromium browsers (no store listing):
 1. Open the browser's Extensions page.
 2. Turn on Developer mode.
 3. Choose Load unpacked and select this folder.
 
-Firefox:
-1. Open about:debugging#/runtime/this-firefox.
-2. Choose Load Temporary Add-on.
-3. Select manifest.json in this folder.
+Development only: Firefox can also load this folder with
+about:debugging#/runtime/this-firefox > Load Temporary Add-on > manifest-firefox.json
+(copy it to manifest.json first). Firefox removes temporary add-ons when it closes.
 
 Keep furrpc running. The extension only sends the title and playback timing of
 the currently playing tab to 127.0.0.1 on this Mac. Remove it from the browser's
